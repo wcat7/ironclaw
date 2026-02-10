@@ -27,7 +27,8 @@ use crate::tools::mcp::config::{
     McpServerConfig, add_mcp_server, get_mcp_server, load_mcp_servers, remove_mcp_server,
 };
 use crate::tools::mcp::session::McpSessionManager;
-use crate::tools::wasm::{WasmToolLoader, WasmToolRuntime, discover_tools};
+#[cfg(feature = "wasm")]
+use crate::tools::wasm::{discover_tools, WasmToolLoader, WasmToolRuntime};
 
 /// Pending OAuth authorization state.
 struct PendingAuth {
@@ -46,8 +47,11 @@ pub struct ExtensionManager {
     /// Active MCP clients keyed by server name.
     mcp_clients: RwLock<HashMap<String, Arc<McpClient>>>,
 
-    // WASM tool infrastructure
+    // WASM tool infrastructure (optional when wasm feature is disabled)
+    #[cfg(feature = "wasm")]
     wasm_tool_runtime: Option<Arc<WasmToolRuntime>>,
+    #[cfg(not(feature = "wasm"))]
+    wasm_tool_runtime: Option<()>,
     wasm_tools_dir: PathBuf,
     wasm_channels_dir: PathBuf,
 
@@ -66,7 +70,8 @@ impl ExtensionManager {
         mcp_session_manager: Arc<McpSessionManager>,
         secrets: Arc<dyn SecretsStore + Send + Sync>,
         tool_registry: Arc<ToolRegistry>,
-        wasm_tool_runtime: Option<Arc<WasmToolRuntime>>,
+        #[cfg(feature = "wasm")] wasm_tool_runtime: Option<Arc<WasmToolRuntime>>,
+        #[cfg(not(feature = "wasm"))] wasm_tool_runtime: Option<()>,
         wasm_tools_dir: PathBuf,
         wasm_channels_dir: PathBuf,
         tunnel_url: Option<String>,
@@ -228,7 +233,8 @@ impl ExtensionManager {
             }
         }
 
-        // List WASM tools
+        // List WASM tools (only when wasm feature is enabled)
+        #[cfg(feature = "wasm")]
         if (kind_filter.is_none() || kind_filter == Some(ExtensionKind::WasmTool))
             && self.wasm_tools_dir.exists()
         {
@@ -254,7 +260,8 @@ impl ExtensionManager {
             }
         }
 
-        // List WASM channels
+        // List WASM channels (only when wasm feature is enabled)
+        #[cfg(feature = "wasm")]
         if (kind_filter.is_none() || kind_filter == Some(ExtensionKind::WasmChannel))
             && self.wasm_channels_dir.exists()
         {
@@ -637,6 +644,15 @@ impl ExtensionManager {
         name: &str,
         token: Option<&str>,
     ) -> Result<AuthResult, ExtensionError> {
+        #[cfg(not(feature = "wasm"))]
+        {
+            let _ = (name, token);
+            return Err(ExtensionError::Other(
+                "WASM support not compiled in".to_string(),
+            ));
+        }
+        #[cfg(feature = "wasm")]
+        {
         // Read the capabilities file to get auth config
         let cap_path = self
             .wasm_tools_dir
@@ -759,6 +775,7 @@ impl ExtensionManager {
             awaiting_token: true,
             status: "awaiting_token".to_string(),
         })
+        }
     }
 
     async fn activate_mcp(&self, name: &str) -> Result<ActivateResult, ExtensionError> {
@@ -842,6 +859,15 @@ impl ExtensionManager {
     }
 
     async fn activate_wasm_tool(&self, name: &str) -> Result<ActivateResult, ExtensionError> {
+        #[cfg(not(feature = "wasm"))]
+        {
+            let _ = name;
+            return Err(ExtensionError::Other(
+                "WASM support not compiled in".to_string(),
+            ));
+        }
+        #[cfg(feature = "wasm")]
+        {
         // Check if already active
         if self.tool_registry.has(name).await {
             return Ok(ActivateResult {
@@ -888,6 +914,7 @@ impl ExtensionManager {
             tools_loaded: vec![name.to_string()],
             message: format!("WASM tool '{}' loaded and ready", name),
         })
+        }
     }
 
     /// Determine what kind of installed extension this is.

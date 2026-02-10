@@ -17,6 +17,7 @@ use crate::tools::builtin::{
     ToolListTool, ToolRemoveTool, ToolSearchTool, WriteFileTool,
 };
 use crate::tools::tool::Tool;
+#[cfg(feature = "wasm")]
 use crate::tools::wasm::{
     Capabilities, ResourceLimits, WasmError, WasmStorageError, WasmToolRuntime, WasmToolStore,
     WasmToolWrapper,
@@ -208,21 +209,8 @@ impl ToolRegistry {
     ///
     /// This validates and compiles the WASM component, then registers it as a tool.
     /// The tool will be executed in a sandboxed environment with the given capabilities.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let runtime = Arc::new(WasmToolRuntime::new(WasmRuntimeConfig::default())?);
-    /// let wasm_bytes = std::fs::read("my_tool.wasm")?;
-    ///
-    /// registry.register_wasm(WasmToolRegistration {
-    ///     name: "my_tool",
-    ///     wasm_bytes: &wasm_bytes,
-    ///     runtime: &runtime,
-    ///     description: Some("My custom tool description"),
-    ///     ..Default::default()
-    /// }).await?;
-    /// ```
+    /// Only available when the `wasm` feature is enabled.
+    #[cfg(feature = "wasm")]
     pub async fn register_wasm(&self, reg: WasmToolRegistration<'_>) -> Result<(), WasmError> {
         // Prepare the module (validates and compiles)
         let prepared = reg
@@ -249,22 +237,8 @@ impl ToolRegistry {
     }
 
     /// Register a WASM tool from database storage.
-    ///
-    /// Loads the WASM binary with integrity verification and configures capabilities.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let store = PostgresWasmToolStore::new(pool);
-    /// let runtime = Arc::new(WasmToolRuntime::new(WasmRuntimeConfig::default())?);
-    ///
-    /// registry.register_wasm_from_storage(
-    ///     &store,
-    ///     &runtime,
-    ///     "user_123",
-    ///     "my_tool",
-    /// ).await?;
-    /// ```
+    /// Only available when the `wasm` feature is enabled.
+    #[cfg(feature = "wasm")]
     pub async fn register_wasm_from_storage(
         &self,
         store: &dyn WasmToolStore,
@@ -311,6 +285,7 @@ impl ToolRegistry {
 }
 
 /// Error when registering a WASM tool from storage.
+#[cfg(feature = "wasm")]
 #[derive(Debug, thiserror::Error)]
 pub enum WasmRegistrationError {
     #[error("Storage error: {0}")]
@@ -321,6 +296,7 @@ pub enum WasmRegistrationError {
 }
 
 /// Configuration for registering a WASM tool.
+#[cfg(feature = "wasm")]
 pub struct WasmToolRegistration<'a> {
     /// Unique name for the tool.
     pub name: &'a str,

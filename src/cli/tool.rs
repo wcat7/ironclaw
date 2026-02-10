@@ -13,7 +13,8 @@ use tokio::fs;
 use crate::config::Config;
 use crate::history::Store;
 use crate::secrets::{CreateSecretParams, PostgresSecretsStore, SecretsCrypto, SecretsStore};
-use crate::tools::wasm::{CapabilitiesFile, compute_binary_hash};
+#[cfg(feature = "wasm")]
+use crate::tools::wasm::{compute_binary_hash, CapabilitiesFile};
 
 /// Default tools directory.
 fn default_tools_dir() -> PathBuf {
@@ -102,6 +103,19 @@ pub enum ToolCommand {
 
 /// Run a tool command.
 pub async fn run_tool_command(cmd: ToolCommand) -> anyhow::Result<()> {
+    #[cfg(not(feature = "wasm"))]
+    {
+        let _ = cmd;
+        return Err(anyhow::anyhow!(
+            "WASM tool commands not available (compile with wasm feature)"
+        ));
+    }
+    #[cfg(feature = "wasm")]
+    run_tool_command_wasm(cmd).await
+}
+
+#[cfg(feature = "wasm")]
+async fn run_tool_command_wasm(cmd: ToolCommand) -> anyhow::Result<()> {
     match cmd {
         ToolCommand::Install {
             path,
@@ -120,6 +134,7 @@ pub async fn run_tool_command(cmd: ToolCommand) -> anyhow::Result<()> {
 }
 
 /// Install a WASM tool.
+#[cfg(feature = "wasm")]
 async fn install_tool(
     path: PathBuf,
     name: Option<String>,
@@ -251,6 +266,7 @@ async fn install_tool(
 }
 
 /// Build a WASM component using cargo-component.
+#[cfg(feature = "wasm")]
 fn build_wasm_component(source_dir: &Path, release: bool) -> anyhow::Result<PathBuf> {
     println!("Building WASM component in {}...", source_dir.display());
 
@@ -347,6 +363,7 @@ fn build_wasm_component(source_dir: &Path, release: bool) -> anyhow::Result<Path
 }
 
 /// Find an existing WASM artifact without building.
+#[cfg(feature = "wasm")]
 fn find_wasm_artifact(source_dir: &Path, name: &str, release: bool) -> anyhow::Result<PathBuf> {
     let profile = if release { "release" } else { "debug" };
 
@@ -414,6 +431,7 @@ fn find_wasm_artifact(source_dir: &Path, name: &str, release: bool) -> anyhow::R
 }
 
 /// Extract crate name from Cargo.toml.
+#[cfg(feature = "wasm")]
 async fn extract_crate_name(cargo_toml: &Path) -> anyhow::Result<String> {
     let content = fs::read_to_string(cargo_toml).await?;
 
@@ -435,6 +453,7 @@ async fn extract_crate_name(cargo_toml: &Path) -> anyhow::Result<String> {
 }
 
 /// List installed tools.
+#[cfg(feature = "wasm")]
 async fn list_tools(dir: Option<PathBuf>, verbose: bool) -> anyhow::Result<()> {
     let tools_dir = dir.unwrap_or_else(default_tools_dir);
 
@@ -510,6 +529,7 @@ async fn list_tools(dir: Option<PathBuf>, verbose: bool) -> anyhow::Result<()> {
 }
 
 /// Remove an installed tool.
+#[cfg(feature = "wasm")]
 async fn remove_tool(name: String, dir: Option<PathBuf>) -> anyhow::Result<()> {
     let tools_dir = dir.unwrap_or_else(default_tools_dir);
 
@@ -533,6 +553,7 @@ async fn remove_tool(name: String, dir: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// Show information about a tool.
+#[cfg(feature = "wasm")]
 async fn show_tool_info(name_or_path: String, dir: Option<PathBuf>) -> anyhow::Result<()> {
     let wasm_path = if name_or_path.ends_with(".wasm") {
         PathBuf::from(&name_or_path)
@@ -594,6 +615,7 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Print a brief capabilities summary.
+#[cfg(feature = "wasm")]
 fn print_capabilities_summary(caps: &CapabilitiesFile) {
     let mut parts = Vec::new();
 
@@ -622,6 +644,7 @@ fn print_capabilities_summary(caps: &CapabilitiesFile) {
 }
 
 /// Print detailed capabilities.
+#[cfg(feature = "wasm")]
 fn print_capabilities_detail(caps: &CapabilitiesFile) {
     if let Some(ref http) = caps.http {
         println!("  HTTP:");
@@ -679,6 +702,7 @@ fn print_capabilities_detail(caps: &CapabilitiesFile) {
 }
 
 /// Configure authentication for a tool.
+#[cfg(feature = "wasm")]
 async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyhow::Result<()> {
     let tools_dir = dir.unwrap_or_else(default_tools_dir);
     let caps_path = tools_dir.join(format!("{}.capabilities.json", name));
@@ -795,6 +819,7 @@ async fn auth_tool(name: String, dir: Option<PathBuf>, user_id: String) -> anyho
 }
 
 /// OAuth browser-based login flow.
+#[cfg(feature = "wasm")]
 async fn auth_tool_oauth(
     store: &PostgresSecretsStore,
     user_id: &str,
@@ -1043,6 +1068,7 @@ async fn auth_tool_oauth(
 }
 
 /// Manual token entry flow.
+#[cfg(feature = "wasm")]
 async fn auth_tool_manual(
     store: &PostgresSecretsStore,
     user_id: &str,
@@ -1174,6 +1200,7 @@ fn read_hidden_input() -> anyhow::Result<String> {
 }
 
 /// Validate a token against the validation endpoint.
+#[cfg(feature = "wasm")]
 async fn validate_token(
     token: &str,
     validation: &crate::tools::wasm::ValidationEndpointSchema,
@@ -1216,6 +1243,7 @@ async fn validate_token(
 }
 
 /// Save token to secrets store.
+#[cfg(feature = "wasm")]
 async fn save_token(
     store: &PostgresSecretsStore,
     user_id: &str,

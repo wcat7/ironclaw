@@ -78,10 +78,10 @@ open = "5"
 # The postgres feature provides ToSql/FromSql for postgres-types (shared by tokio-postgres)
 pgvector = { version = "0.4", features = ["postgres"] }
 
-# WASM sandbox for untrusted tool execution
-wasmtime = { version = "28", features = ["component-model"] }
-wasmtime-wasi = "28"  # WASI support for component model
-wasmparser = "0.220"  # WASM binary parsing for validation
+# WASM sandbox for untrusted tool execution (optional; disable for iOS/mobile)
+wasmtime = { version = "28", features = ["component-model"], optional = true }
+wasmtime-wasi = { version = "28", optional = true }
+wasmparser = { version = "0.220", optional = true }
 
 # Cryptography for secrets management
 aes-gcm = "0.10"
@@ -117,5 +117,7 @@ pretty_assertions = "1"
 tempfile = "3"
 
 [features]
-default = []
+default = ["wasm"]
+# WASM tools and WASM channels (wasmtime); disable for iOS/mobile to avoid wasmtime-fiber AArch64 issues
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmparser"]
 integration = []

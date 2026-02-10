@@ -712,7 +712,8 @@ impl WasmConfig {
         })
     }
 
-    /// Convert to WasmRuntimeConfig.
+    /// Convert to WasmRuntimeConfig. Only available when the `wasm` feature is enabled.
+    #[cfg(feature = "wasm")]
     pub fn to_runtime_config(&self) -> crate::tools::wasm::WasmRuntimeConfig {
         use crate::tools::wasm::{FuelConfig, ResourceLimits, WasmRuntimeConfig};
         use std::time::Duration;

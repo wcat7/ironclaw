@@ -346,9 +346,8 @@ pub struct WasmChannelSetupResult {
 }
 
 /// Set up a WASM channel using its capabilities file setup schema.
-///
-/// Reads setup requirements from the channel's capabilities file and
-/// prompts the user for each required secret.
+/// Only available when the `wasm` feature is enabled.
+#[cfg(feature = "wasm")]
 pub async fn setup_wasm_channel(
     secrets: &SecretsContext,
     channel_name: &str,

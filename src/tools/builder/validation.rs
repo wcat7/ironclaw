@@ -141,146 +141,141 @@ impl WasmValidator {
 
     /// Validate WASM bytes.
     pub fn validate_bytes(&self, bytes: &[u8]) -> Result<ValidationResult, ValidationError> {
-        let mut errors = Vec::new();
-        let mut warnings = Vec::new();
-        let mut exports = Vec::new();
-        let mut imports = Vec::new();
         let size_bytes = bytes.len() as u64;
-
-        // Check size
         if size_bytes > self.max_size {
-            errors.push(ValidationError::TooLarge {
+            return Err(ValidationError::TooLarge {
                 size: size_bytes,
                 max: self.max_size,
             });
         }
+        #[cfg(feature = "wasm")]
+        {
+            let mut errors = Vec::new();
+            let mut warnings = Vec::new();
+            let mut exports = Vec::new();
+            let mut imports = Vec::new();
 
-        // Parse WASM module
-        let parser = wasmparser::Parser::new(0);
-
-        for payload in parser.parse_all(bytes) {
-            match payload {
-                Ok(wasmparser::Payload::ExportSection(reader)) => {
-                    for export in reader {
-                        match export {
-                            Ok(exp) => {
-                                let kind = match exp.kind {
-                                    wasmparser::ExternalKind::Func => ExportKind::Function,
-                                    wasmparser::ExternalKind::Memory => ExportKind::Memory,
-                                    wasmparser::ExternalKind::Table => ExportKind::Table,
-                                    wasmparser::ExternalKind::Global => ExportKind::Global,
-                                    wasmparser::ExternalKind::Tag => continue,
-                                };
-                                exports.push(ExportInfo {
-                                    name: exp.name.to_string(),
-                                    kind,
-                                });
-                            }
-                            Err(e) => {
-                                errors.push(ValidationError::InvalidModule(format!(
-                                    "Failed to parse export: {}",
-                                    e
-                                )));
-                            }
-                        }
-                    }
-                }
-                Ok(wasmparser::Payload::ImportSection(reader)) => {
-                    for import in reader {
-                        match import {
-                            Ok(imp) => {
-                                let kind = match imp.ty {
-                                    wasmparser::TypeRef::Func(_) => ImportKind::Function,
-                                    wasmparser::TypeRef::Memory(_) => ImportKind::Memory,
-                                    wasmparser::TypeRef::Table(_) => ImportKind::Table,
-                                    wasmparser::TypeRef::Global(_) => ImportKind::Global,
-                                    wasmparser::TypeRef::Tag(_) => continue,
-                                };
-
-                                imports.push(ImportInfo {
-                                    module: imp.module.to_string(),
-                                    name: imp.name.to_string(),
-                                    kind,
-                                });
-
-                                // Check if import module is allowed
-                                if !self
-                                    .allowed_import_modules
-                                    .contains(&imp.module.to_string())
-                                {
-                                    errors.push(ValidationError::DisallowedImport {
-                                        module: imp.module.to_string(),
-                                        name: imp.name.to_string(),
+            let parser = wasmparser::Parser::new(0);
+            for payload in parser.parse_all(bytes) {
+                match payload {
+                    Ok(wasmparser::Payload::ExportSection(reader)) => {
+                        for export in reader {
+                            match export {
+                                Ok(exp) => {
+                                    let kind = match exp.kind {
+                                        wasmparser::ExternalKind::Func => ExportKind::Function,
+                                        wasmparser::ExternalKind::Memory => ExportKind::Memory,
+                                        wasmparser::ExternalKind::Table => ExportKind::Table,
+                                        wasmparser::ExternalKind::Global => ExportKind::Global,
+                                        wasmparser::ExternalKind::Tag => continue,
+                                    };
+                                    exports.push(ExportInfo {
+                                        name: exp.name.to_string(),
+                                        kind,
                                     });
                                 }
-                            }
-                            Err(e) => {
-                                errors.push(ValidationError::InvalidModule(format!(
-                                    "Failed to parse import: {}",
-                                    e
-                                )));
+                                Err(e) => {
+                                    errors.push(ValidationError::InvalidModule(format!(
+                                        "Failed to parse export: {}",
+                                        e
+                                    )));
+                                }
                             }
                         }
                     }
-                }
-                Ok(_) => {
-                    // Other sections are OK
-                }
-                Err(e) => {
-                    errors.push(ValidationError::InvalidModule(format!(
-                        "Failed to parse WASM: {}",
-                        e
-                    )));
-                    break;
+                    Ok(wasmparser::Payload::ImportSection(reader)) => {
+                        for import in reader {
+                            match import {
+                                Ok(imp) => {
+                                    let kind = match imp.ty {
+                                        wasmparser::TypeRef::Func(_) => ImportKind::Function,
+                                        wasmparser::TypeRef::Memory(_) => ImportKind::Memory,
+                                        wasmparser::TypeRef::Table(_) => ImportKind::Table,
+                                        wasmparser::TypeRef::Global(_) => ImportKind::Global,
+                                        wasmparser::TypeRef::Tag(_) => continue,
+                                    };
+                                    imports.push(ImportInfo {
+                                        module: imp.module.to_string(),
+                                        name: imp.name.to_string(),
+                                        kind,
+                                    });
+                                    if !self
+                                        .allowed_import_modules
+                                        .contains(&imp.module.to_string())
+                                    {
+                                        errors.push(ValidationError::DisallowedImport {
+                                            module: imp.module.to_string(),
+                                            name: imp.name.to_string(),
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    errors.push(ValidationError::InvalidModule(format!(
+                                        "Failed to parse import: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        errors.push(ValidationError::InvalidModule(format!(
+                            "Failed to parse WASM: {}",
+                            e
+                        )));
+                        break;
+                    }
                 }
             }
-        }
-
-        // Check required exports
-        for required in &self.required_exports {
-            if !exports.iter().any(|e| &e.name == required) {
-                errors.push(ValidationError::MissingExport(required.clone()));
+            for required in &self.required_exports {
+                if !exports.iter().any(|e| &e.name == required) {
+                    errors.push(ValidationError::MissingExport(required.clone()));
+                }
             }
+            if !exports
+                .iter()
+                .any(|e| e.name == "memory" && e.kind == ExportKind::Memory)
+            {
+                warnings.push(
+                    "Module does not export memory - host cannot read/write data".to_string(),
+                );
+            }
+            for import in &imports {
+                if import.module == "wasi_snapshot_preview1" {
+                    match import.name.as_str() {
+                        "fd_write" | "fd_read" | "path_open" | "path_create_directory" => {
+                            warnings.push(format!(
+                                "Module uses WASI filesystem function '{}' - ensure this is intended",
+                                import.name
+                            ));
+                        }
+                        "sock_send" | "sock_recv" | "sock_accept" => {
+                            warnings.push(format!(
+                                "Module uses WASI socket function '{}' - ensure this is intended",
+                                import.name
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(ValidationResult {
+                is_valid: errors.is_empty(),
+                errors,
+                warnings,
+                exports,
+                imports,
+                size_bytes,
+            })
         }
-
-        // Check for common issues (warnings)
-        if !exports
-            .iter()
-            .any(|e| e.name == "memory" && e.kind == ExportKind::Memory)
+        #[cfg(not(feature = "wasm"))]
         {
-            warnings
-                .push("Module does not export memory - host cannot read/write data".to_string());
+            let _ = size_bytes;
+            Err(ValidationError::Other(
+                "WASM support not compiled in (disable wasm feature for mobile)".to_string(),
+            ))
         }
-
-        // Check for potentially dangerous imports
-        for import in &imports {
-            if import.module == "wasi_snapshot_preview1" {
-                match import.name.as_str() {
-                    "fd_write" | "fd_read" | "path_open" | "path_create_directory" => {
-                        warnings.push(format!(
-                            "Module uses WASI filesystem function '{}' - ensure this is intended",
-                            import.name
-                        ));
-                    }
-                    "sock_send" | "sock_recv" | "sock_accept" => {
-                        warnings.push(format!(
-                            "Module uses WASI socket function '{}' - ensure this is intended",
-                            import.name
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        Ok(ValidationResult {
-            is_valid: errors.is_empty(),
-            errors,
-            warnings,
-            exports,
-            imports,
-            size_bytes,
-        })
     }
 }
 

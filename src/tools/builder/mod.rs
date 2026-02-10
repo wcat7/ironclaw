@@ -25,6 +25,7 @@
 
 mod core;
 mod templates;
+#[cfg(feature = "wasm")]
 mod testing;
 mod validation;
 
@@ -33,5 +34,6 @@ pub use core::{
     Language, LlmSoftwareBuilder, SoftwareBuilder, SoftwareType,
 };
 pub use templates::{Template, TemplateEngine, TemplateType};
+#[cfg(feature = "wasm")]
 pub use testing::{TestCase, TestHarness, TestResult, TestSuite};
 pub use validation::{ValidationError, ValidationResult, WasmValidator};

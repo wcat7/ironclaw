@@ -16,15 +16,16 @@ use deadpool_postgres::{Config as PoolConfig, Runtime};
 use secrecy::SecretString;
 use tokio_postgres::NoTls;
 
+#[cfg(feature = "wasm")]
 use crate::channels::wasm::{
-    ChannelCapabilitiesFile, bundled_channel_names, install_bundled_channel,
+    bundled_channel_names, install_bundled_channel, ChannelCapabilitiesFile,
 };
 use crate::llm::{SessionConfig, SessionManager};
 use crate::secrets::SecretsCrypto;
 use crate::settings::{KeySource, Settings};
-use crate::setup::channels::{
-    SecretsContext, setup_http, setup_telegram, setup_tunnel, setup_wasm_channel,
-};
+use crate::setup::channels::{SecretsContext, setup_http, setup_telegram, setup_tunnel};
+#[cfg(feature = "wasm")]
+use crate::setup::channels::setup_wasm_channel;
 use crate::setup::prompts::{
     confirm, input, optional_input, print_error, print_header, print_info, print_step,
     print_success, select_many, select_one,
@@ -583,11 +584,13 @@ impl SetupWizard {
         }
         println!();
 
-        // Discover available WASM channels
         let channels_dir = dirs::home_dir()
             .unwrap_or_default()
             .join(".ironclaw/channels");
 
+        #[cfg(feature = "wasm")]
+        {
+        // Discover available WASM channels
         let mut discovered_channels = discover_wasm_channels(&channels_dir).await;
         let installed_names: HashSet<String> = discovered_channels
             .iter()
@@ -604,7 +607,6 @@ impl SetupWizard {
             ),
         ];
 
-        // Add available WASM channels (installed + bundled)
         for name in &wasm_channel_names {
             let is_enabled = self.settings.channels.wasm_channels.contains(name);
             let display_name = format!("{} (WASM)", capitalize_first(name));
@@ -642,7 +644,6 @@ impl SetupWizard {
             }
         }
 
-        // Determine if we need secrets context
         let needs_secrets = selected.contains(&1) || !selected_wasm_channels.is_empty();
         let secrets = if needs_secrets {
             match self.init_secrets_context().await {
@@ -657,7 +658,6 @@ impl SetupWizard {
             None
         };
 
-        // HTTP is index 1
         if selected.contains(&1) {
             println!();
             if let Some(ref ctx) = secrets {
@@ -676,7 +676,6 @@ impl SetupWizard {
         let discovered_by_name: HashMap<String, ChannelCapabilitiesFile> =
             discovered_channels.into_iter().collect();
 
-        // Process selected WASM channels
         let mut enabled_wasm_channels = Vec::new();
         for channel_name in selected_wasm_channels {
             println!();
@@ -715,7 +714,6 @@ impl SetupWizard {
                     enabled_wasm_channels.push(result.channel_name);
                 }
             } else {
-                // No secrets context, just enable the channel
                 print_info(&format!(
                     "{} enabled (configure tokens via environment)",
                     capitalize_first(&channel_name)
@@ -725,6 +723,43 @@ impl SetupWizard {
         }
 
         self.settings.channels.wasm_channels = enabled_wasm_channels;
+        }
+
+        #[cfg(not(feature = "wasm"))]
+        {
+        let options: Vec<(&str, bool)> = vec![
+            ("CLI/TUI (always enabled)", true),
+            ("HTTP webhook", self.settings.channels.http_enabled),
+        ];
+        let selected = select_many("Which channels do you want to enable?", &options)
+            .map_err(SetupError::Io)?;
+        let secrets = if selected.contains(&1) {
+            match self.init_secrets_context().await {
+                Ok(ctx) => Some(ctx),
+                Err(e) => {
+                    print_info(&format!("Secrets not available: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if selected.contains(&1) {
+            println!();
+            if let Some(ref ctx) = secrets {
+                let result = setup_http(ctx).await.map_err(SetupError::Channel)?;
+                self.settings.channels.http_enabled = result.enabled;
+                self.settings.channels.http_port = Some(result.port);
+            } else {
+                self.settings.channels.http_enabled = true;
+                self.settings.channels.http_port = Some(8080);
+                print_info("HTTP webhook enabled on port 8080 (set HTTP_WEBHOOK_SECRET in env)");
+            }
+        } else {
+            self.settings.channels.http_enabled = false;
+        }
+        self.settings.channels.wasm_channels = Vec::new();
+        }
 
         Ok(())
     }
@@ -896,9 +931,8 @@ fn mask_password_in_url(url: &str) -> String {
     format!("{}{}:****{}", scheme, username, after_at)
 }
 
-/// Discover WASM channels in a directory.
-///
-/// Returns a list of (channel_name, capabilities_file) pairs.
+/// Discover WASM channels in a directory. Only available when the `wasm` feature is enabled.
+#[cfg(feature = "wasm")]
 async fn discover_wasm_channels(dir: &std::path::Path) -> Vec<(String, ChannelCapabilitiesFile)> {
     let mut channels = Vec::new();
 
@@ -992,6 +1026,7 @@ async fn install_missing_bundled_channels(
     Ok(installed)
 }
 
+#[cfg(feature = "wasm")]
 fn wasm_channel_option_names(discovered: &[(String, ChannelCapabilitiesFile)]) -> Vec<String> {
     let mut names: Vec<String> = discovered.iter().map(|(name, _)| name.clone()).collect();
 
@@ -1004,6 +1039,7 @@ fn wasm_channel_option_names(discovered: &[(String, ChannelCapabilitiesFile)]) -
     names
 }
 
+#[cfg(feature = "wasm")]
 async fn install_selected_bundled_channels(
     channels_dir: &std::path::Path,
     selected_channels: &[String],

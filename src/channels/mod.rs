@@ -31,6 +31,7 @@ mod channel;
 mod http;
 mod manager;
 mod repl;
+#[cfg(feature = "wasm")]
 pub mod wasm;
 pub mod web;
 mod webhook_server;

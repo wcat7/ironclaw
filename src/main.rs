@@ -182,16 +182,22 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    // Initialize session manager and authenticate before channel setup
-    let session_config = SessionConfig {
-        auth_base_url: config.llm.nearai.auth_base_url.clone(),
-        session_path: config.llm.nearai.session_path.clone(),
-        ..Default::default()
+    // Initialize session manager only when using NEAR AI provider
+    use ironclaw::config::LLM_PROVIDER_OPENAI_COMPATIBLE;
+    let session_opt = if config.llm.provider == LLM_PROVIDER_OPENAI_COMPATIBLE {
+        tracing::info!("Using OpenAI-compatible LLM; no session needed");
+        None
+    } else {
+        let session_config = SessionConfig {
+            auth_base_url: config.llm.nearai.auth_base_url.clone(),
+            session_path: config.llm.nearai.session_path.clone(),
+            ..Default::default()
+        };
+        let session = create_session_manager(session_config).await;
+        session.ensure_authenticated().await?;
+        tracing::info!("NEAR AI session authenticated");
+        Some(session)
     };
-    let session = create_session_manager(session_config).await;
-
-    // Ensure we're authenticated before proceeding (may trigger login flow)
-    session.ensure_authenticated().await?;
 
     // Initialize tracing
     let env_filter = EnvFilter::try_from_default_env()
@@ -218,7 +224,6 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting IronClaw...");
     tracing::info!("Loaded configuration for agent: {}", config.agent.name);
-    tracing::info!("NEAR AI session authenticated");
 
     // Initialize database store (optional for testing)
     let store = if cli.no_db {
@@ -231,8 +236,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Arc::new(store))
     };
 
-    // Initialize LLM provider (clone session so we can reuse it for embeddings)
-    let llm = create_llm_provider(&config.llm, session.clone())?;
+    // Initialize LLM provider
+    let llm = create_llm_provider(&config.llm, session_opt.clone())?;
     tracing::info!("LLM provider initialized: {}", llm.model_name());
 
     // Initialize safety layer
@@ -247,16 +252,16 @@ async fn main() -> anyhow::Result<()> {
     // Create embeddings provider if configured
     let embeddings: Option<Arc<dyn EmbeddingProvider>> = if config.embeddings.enabled {
         match config.embeddings.provider.as_str() {
-            "nearai" => {
+            "nearai" => session_opt.as_ref().map(|session| {
                 tracing::info!(
                     "Embeddings enabled via NEAR AI (model: {})",
                     config.embeddings.model
                 );
-                Some(Arc::new(
+                Arc::new(
                     NearAiEmbeddings::new(&config.llm.nearai.base_url, session.clone())
                         .with_model(&config.embeddings.model, 1536),
-                ))
-            }
+                ) as Arc<dyn EmbeddingProvider>
+            }),
             _ => {
                 // Default to OpenAI for unknown providers
                 if let Some(api_key) = config.embeddings.openai_api_key() {

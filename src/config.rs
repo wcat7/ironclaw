@@ -265,10 +265,29 @@ mod config_tests {
     }
 }
 
-/// LLM provider configuration (NEAR AI only).
+/// LLM provider kind: "nearai" (default) or "openai_compatible".
+pub const LLM_PROVIDER_NEARAI: &str = "nearai";
+pub const LLM_PROVIDER_OPENAI_COMPATIBLE: &str = "openai_compatible";
+
+/// LLM provider configuration.
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
+    /// Which provider to use: "nearai" or "openai_compatible".
+    pub provider: String,
     pub nearai: NearAiConfig,
+    /// Set when provider == "openai_compatible".
+    pub openai_compatible: Option<OpenAiCompatibleConfig>,
+}
+
+/// OpenAI-compatible API configuration (any service with /v1/chat/completions).
+#[derive(Debug, Clone)]
+pub struct OpenAiCompatibleConfig {
+    /// Base URL (e.g. https://api.openai.com or http://127.0.0.1:8765).
+    pub base_url: String,
+    /// API key; empty/None for local or keyless endpoints (e.g. system model server).
+    pub api_key: Option<SecretString>,
+    /// Model name (e.g. gpt-4o, or "apple" for system model).
+    pub model: String,
 }
 
 /// API mode for NEAR AI.
@@ -317,24 +336,43 @@ pub struct NearAiConfig {
 
 impl LlmConfig {
     fn from_env() -> Result<Self, ConfigError> {
-        let api_key = optional_env("NEARAI_API_KEY")?.map(SecretString::from);
+        let provider = optional_env("LLM_PROVIDER")?
+            .unwrap_or_else(|| LLM_PROVIDER_NEARAI.to_string());
 
-        // Determine API mode: explicit setting, or infer from API key presence
+        let openai_compatible = if provider == LLM_PROVIDER_OPENAI_COMPATIBLE {
+            let base_url = optional_env("OPENAI_COMPATIBLE_BASE_URL")?.ok_or_else(|| {
+                ConfigError::MissingRequired {
+                    key: "OPENAI_COMPATIBLE_BASE_URL".to_string(),
+                    hint: "Set OPENAI_COMPATIBLE_BASE_URL (e.g. https://api.openai.com or http://127.0.0.1:8765)".to_string(),
+                }
+            })?;
+            let api_key = optional_env("OPENAI_COMPATIBLE_API_KEY")?.map(SecretString::from);
+            let model = optional_env("OPENAI_COMPATIBLE_MODEL")?
+                .unwrap_or_else(|| "default".to_string());
+            Some(OpenAiCompatibleConfig {
+                base_url,
+                api_key,
+                model,
+            })
+        } else {
+            None
+        };
+
+        let api_key = optional_env("NEARAI_API_KEY")?.map(SecretString::from);
         let api_mode = if let Some(mode_str) = optional_env("NEARAI_API_MODE")? {
             mode_str.parse().map_err(|e| ConfigError::InvalidValue {
                 key: "NEARAI_API_MODE".to_string(),
                 message: e,
             })?
         } else if api_key.is_some() {
-            // If API key is provided, default to chat_completions mode
             NearAiApiMode::ChatCompletions
         } else {
             NearAiApiMode::Responses
         };
 
         Ok(Self {
+            provider,
             nearai: NearAiConfig {
-                // Load model from saved settings first, then env, then default
                 model: crate::settings::Settings::load()
                     .selected_model
                     .or_else(|| optional_env("NEARAI_MODEL").ok().flatten())
@@ -352,6 +390,7 @@ impl LlmConfig {
                 api_mode,
                 api_key,
             },
+            openai_compatible,
         })
     }
 }

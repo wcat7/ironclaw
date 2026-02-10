@@ -27,11 +27,20 @@ pub struct Config {
 impl Config {
     /// Load configuration from environment variables.
     pub fn from_env() -> Result<Self, ConfigError> {
+        Self::from_env_with_database_url(None)
+    }
+
+    /// Load configuration from environment, with optional database URL override.
+    /// When `database_url_override` is `Some(url)`, that URL is used instead of
+    /// DATABASE_URL / settings (e.g. pass an iOS path or URL from Flutter).
+    pub fn from_env_with_database_url(
+        database_url_override: Option<&str>,
+    ) -> Result<Self, ConfigError> {
         // Load .env file if present (ignore errors if not found)
         let _ = dotenvy::dotenv();
 
         Ok(Self {
-            database: DatabaseConfig::from_env()?,
+            database: DatabaseConfig::from_env_with_override(database_url_override)?,
             llm: LlmConfig::from_env()?,
             embeddings: EmbeddingsConfig::from_env()?,
             tunnel: TunnelConfig::from_env()?,
@@ -122,6 +131,39 @@ impl TunnelConfig {
     }
 }
 
+/// Database kind inferred from URL scheme/path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbKind {
+    Postgres,
+    Sqlite,
+}
+
+impl DbKind {
+    /// Detect database kind from URL string.
+    /// - `postgres://` or `postgresql://` -> Postgres
+    /// - `sqlite://` or bare path (no `://`) -> Sqlite
+    pub fn from_url(url: &str) -> Result<Self, ConfigError> {
+        let url = url.trim();
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            return Ok(Self::Postgres);
+        }
+        if url.starts_with("sqlite://") {
+            return Ok(Self::Sqlite);
+        }
+        // Bare path (e.g. /path/to/ironclaw.db or C:\path\file.db)
+        if !url.contains("://") {
+            return Ok(Self::Sqlite);
+        }
+        Err(ConfigError::InvalidValue {
+            key: "DATABASE_URL".to_string(),
+            message: format!(
+                "Unsupported scheme. Use postgres://, postgresql://, sqlite://, or a file path. Got: {}",
+                if url.len() > 60 { format!("{}...", &url[..60]) } else { url.to_string() }
+            ),
+        })
+    }
+}
+
 /// Database configuration.
 #[derive(Debug, Clone)]
 pub struct DatabaseConfig {
@@ -131,15 +173,26 @@ pub struct DatabaseConfig {
 
 impl DatabaseConfig {
     fn from_env() -> Result<Self, ConfigError> {
+        Self::from_env_with_override(None)
+    }
+
+    /// Build from env/settings with optional URL override (e.g. from mobile app path).
+    fn from_env_with_override(optional_url: Option<&str>) -> Result<Self, ConfigError> {
         let settings = crate::settings::Settings::load();
 
-        // Priority: env var > settings > error (required)
-        let url = optional_env("DATABASE_URL")?
+        // Priority: override > env var > settings > error (required)
+        let from_env = optional_env("DATABASE_URL")?;
+        let url = optional_url
+            .map(String::from)
+            .or(from_env)
             .or(settings.database_url.clone())
             .ok_or_else(|| ConfigError::MissingRequired {
                 key: "database_url".to_string(),
                 hint: "Run 'ironclaw onboard' or set DATABASE_URL environment variable".to_string(),
             })?;
+
+        // Validate scheme / path
+        let _ = DbKind::from_url(&url)?;
 
         // Priority: env var > settings > default
         let pool_size = optional_env("DATABASE_POOL_SIZE")?
@@ -161,6 +214,54 @@ impl DatabaseConfig {
     /// Get the database URL (exposes the secret).
     pub fn url(&self) -> &str {
         self.url.expose_secret()
+    }
+
+    /// Database kind for this config.
+    pub fn kind(&self) -> Result<DbKind, ConfigError> {
+        DbKind::from_url(self.url())
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    /// Build database config from URL (for tests only).
+    pub fn for_test(url: impl AsRef<str>) -> Self {
+        use secrecy::SecretString;
+        Self {
+            url: SecretString::from(url.as_ref().to_string()),
+            pool_size: 2,
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+mod config_tests {
+    use super::{DatabaseConfig, DbKind};
+
+    #[test]
+    fn test_db_kind_from_url_postgres() {
+        assert_eq!(DbKind::from_url("postgres://localhost/db").unwrap(), DbKind::Postgres);
+        assert_eq!(DbKind::from_url("postgresql://user:pass@host/db").unwrap(), DbKind::Postgres);
+    }
+
+    #[test]
+    fn test_db_kind_from_url_sqlite() {
+        assert_eq!(DbKind::from_url("sqlite:///path/to/db").unwrap(), DbKind::Sqlite);
+        assert_eq!(DbKind::from_url("sqlite://:memory:").unwrap(), DbKind::Sqlite);
+        assert_eq!(DbKind::from_url("/tmp/ironclaw.db").unwrap(), DbKind::Sqlite);
+        assert_eq!(DbKind::from_url("relative/path.db").unwrap(), DbKind::Sqlite);
+    }
+
+    #[test]
+    fn test_db_kind_from_url_unsupported() {
+        assert!(DbKind::from_url("mysql://localhost/db").is_err());
+        assert!(DbKind::from_url("http://example.com").is_err());
+    }
+
+    #[test]
+    fn test_database_config_kind() {
+        let cfg = DatabaseConfig::for_test("sqlite://");
+        assert_eq!(cfg.kind().unwrap(), DbKind::Sqlite);
+        let cfg = DatabaseConfig::for_test("postgres://localhost/foo");
+        assert_eq!(cfg.kind().unwrap(), DbKind::Postgres);
     }
 }
 

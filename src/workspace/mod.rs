@@ -43,14 +43,18 @@
 mod chunker;
 mod document;
 mod embeddings;
+mod repo_backend;
 mod repository;
 mod search;
+mod sqlite_repo;
 
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{MemoryChunk, MemoryDocument, WorkspaceEntry, paths};
 pub use embeddings::{EmbeddingProvider, MockEmbeddings, NearAiEmbeddings, OpenAiEmbeddings};
+pub use repo_backend::WorkspaceRepoBackend;
 pub use repository::Repository;
 pub use search::{SearchConfig, SearchResult};
+pub use sqlite_repo::SqliteWorkspaceRepo;
 
 use std::sync::Arc;
 
@@ -80,25 +84,35 @@ const HEARTBEAT_SEED: &str = "\
 /// Workspace provides database-backed memory storage for an agent.
 ///
 /// Each workspace is scoped to a user (and optionally an agent).
-/// Documents are persisted to PostgreSQL and indexed for search.
+/// Documents are persisted via Postgres or SQLite and indexed for search.
 pub struct Workspace {
     /// User identifier (from channel).
     user_id: String,
     /// Optional agent ID for multi-agent isolation.
     agent_id: Option<Uuid>,
-    /// Database repository.
-    repo: Repository,
+    /// Database repository (Postgres or SQLite backend).
+    repo: Arc<dyn WorkspaceRepoBackend>,
     /// Embedding provider for semantic search.
     embeddings: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl Workspace {
-    /// Create a new workspace for a user.
+    /// Create a new workspace for a user (Postgres pool).
     pub fn new(user_id: impl Into<String>, pool: Pool) -> Self {
         Self {
             user_id: user_id.into(),
             agent_id: None,
-            repo: Repository::new(pool),
+            repo: Arc::new(Repository::new(pool)),
+            embeddings: None,
+        }
+    }
+
+    /// Create a workspace with a custom repo backend (e.g. SQLite).
+    pub fn new_with_repo(user_id: impl Into<String>, repo: Arc<dyn WorkspaceRepoBackend>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            agent_id: None,
+            repo,
             embeddings: None,
         }
     }
@@ -139,7 +153,7 @@ impl Workspace {
     pub async fn read(&self, path: &str) -> Result<MemoryDocument, WorkspaceError> {
         let path = normalize_path(path);
         self.repo
-            .get_document_by_path(&self.user_id, self.agent_id, &path)
+            .repo_get_document_by_path(&self.user_id, self.agent_id, &path)
             .await
     }
 
@@ -156,13 +170,13 @@ impl Workspace {
         let path = normalize_path(path);
         let doc = self
             .repo
-            .get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
+            .repo_get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
             .await?;
-        self.repo.update_document(doc.id, content).await?;
+        self.repo.repo_update_document(doc.id, content).await?;
         self.reindex_document(doc.id).await?;
 
         // Return updated doc
-        self.repo.get_document_by_id(doc.id).await
+        self.repo.repo_get_document_by_id(doc.id).await
     }
 
     /// Append content to a file.
@@ -173,7 +187,7 @@ impl Workspace {
         let path = normalize_path(path);
         let doc = self
             .repo
-            .get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
+            .repo_get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
             .await?;
 
         let new_content = if doc.content.is_empty() {
@@ -182,7 +196,7 @@ impl Workspace {
             format!("{}\n{}", doc.content, content)
         };
 
-        self.repo.update_document(doc.id, &new_content).await?;
+        self.repo.repo_update_document(doc.id, &new_content).await?;
         self.reindex_document(doc.id).await?;
         Ok(())
     }
@@ -192,7 +206,7 @@ impl Workspace {
         let path = normalize_path(path);
         match self
             .repo
-            .get_document_by_path(&self.user_id, self.agent_id, &path)
+            .repo_get_document_by_path(&self.user_id, self.agent_id, &path)
             .await
         {
             Ok(_) => Ok(true),
@@ -207,7 +221,7 @@ impl Workspace {
     pub async fn delete(&self, path: &str) -> Result<(), WorkspaceError> {
         let path = normalize_path(path);
         self.repo
-            .delete_document_by_path(&self.user_id, self.agent_id, &path)
+            .repo_delete_document_by_path(&self.user_id, self.agent_id, &path)
             .await
     }
 
@@ -230,13 +244,13 @@ impl Workspace {
     pub async fn list(&self, directory: &str) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
         let directory = normalize_directory(directory);
         self.repo
-            .list_directory(&self.user_id, self.agent_id, &directory)
+            .repo_list_directory(&self.user_id, self.agent_id, &directory)
             .await
     }
 
     /// List all files recursively (flat list of all paths).
     pub async fn list_all(&self) -> Result<Vec<String>, WorkspaceError> {
-        self.repo.list_all_paths(&self.user_id, self.agent_id).await
+        self.repo.repo_list_all_paths(&self.user_id, self.agent_id).await
     }
 
     // ==================== Convenience Methods ====================
@@ -281,7 +295,7 @@ impl Workspace {
     /// Helper to read or create a file.
     async fn read_or_create(&self, path: &str) -> Result<MemoryDocument, WorkspaceError> {
         self.repo
-            .get_or_create_document_by_path(&self.user_id, self.agent_id, path)
+            .repo_get_or_create_document_by_path(&self.user_id, self.agent_id, path)
             .await
     }
 
@@ -299,7 +313,7 @@ impl Workspace {
         } else {
             format!("{}\n\n{}", doc.content, entry)
         };
-        self.repo.update_document(doc.id, &new_content).await?;
+        self.repo.repo_update_document(doc.id, &new_content).await?;
         self.reindex_document(doc.id).await?;
         Ok(())
     }
@@ -396,7 +410,7 @@ impl Workspace {
         };
 
         self.repo
-            .hybrid_search(
+            .repo_hybrid_search(
                 &self.user_id,
                 self.agent_id,
                 query,
@@ -411,13 +425,13 @@ impl Workspace {
     /// Re-index a document (chunk and generate embeddings).
     async fn reindex_document(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
         // Get the document
-        let doc = self.repo.get_document_by_id(document_id).await?;
+        let doc = self.repo.repo_get_document_by_id(document_id).await?;
 
         // Chunk the content
         let chunks = chunk_document(&doc.content, ChunkConfig::default());
 
         // Delete old chunks
-        self.repo.delete_chunks(document_id).await?;
+        self.repo.repo_delete_chunks(document_id).await?;
 
         // Insert new chunks
         for (index, content) in chunks.into_iter().enumerate() {
@@ -435,7 +449,7 @@ impl Workspace {
             };
 
             self.repo
-                .insert_chunk(document_id, index as i32, &content, embedding.as_deref())
+                .repo_insert_chunk(document_id, index as i32, &content, embedding.as_deref())
                 .await?;
         }
 
@@ -452,7 +466,7 @@ impl Workspace {
 
         let chunks = self
             .repo
-            .get_chunks_without_embeddings(&self.user_id, self.agent_id, 100)
+            .repo_get_chunks_without_embeddings(&self.user_id, self.agent_id, 100)
             .await?;
 
         let mut count = 0;
@@ -460,7 +474,7 @@ impl Workspace {
             match provider.embed(&chunk.content).await {
                 Ok(embedding) => {
                     self.repo
-                        .update_chunk_embedding(chunk.id, &embedding)
+                        .repo_update_chunk_embedding(chunk.id, &embedding)
                         .await?;
                     count += 1;
                 }

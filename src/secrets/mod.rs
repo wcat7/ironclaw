@@ -65,10 +65,8 @@ mod types;
 
 pub use crypto::SecretsCrypto;
 pub use store::{PostgresSecretsStore, SecretsStore};
+pub use store::testing::InMemorySecretsStore;
 pub use types::{
     CreateSecretParams, CredentialLocation, CredentialMapping, DecryptedSecret, Secret,
     SecretError, SecretRef,
 };
-
-#[cfg(test)]
-pub use store::testing::InMemorySecretsStore;

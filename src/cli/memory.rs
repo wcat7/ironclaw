@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use clap::Subcommand;
 
-use crate::workspace::{EmbeddingProvider, SearchConfig, Workspace};
+use crate::workspace::{SearchConfig, Workspace};
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum MemoryCommand {
@@ -55,27 +55,21 @@ pub enum MemoryCommand {
     Status,
 }
 
-/// Run a memory command.
+/// Run a memory command. Workspace must already have embeddings set if semantic search is desired.
 pub async fn run_memory_command(
     cmd: MemoryCommand,
-    pool: deadpool_postgres::Pool,
-    embeddings: Option<Arc<dyn EmbeddingProvider>>,
+    workspace: Arc<Workspace>,
 ) -> anyhow::Result<()> {
-    let mut workspace = Workspace::new("default", pool);
-    if let Some(emb) = embeddings {
-        workspace = workspace.with_embeddings(emb);
-    }
-
     match cmd {
-        MemoryCommand::Search { query, limit } => search(&workspace, &query, limit).await,
-        MemoryCommand::Read { path } => read(&workspace, &path).await,
+        MemoryCommand::Search { query, limit } => search(workspace.as_ref(), &query, limit).await,
+        MemoryCommand::Read { path } => read(workspace.as_ref(), &path).await,
         MemoryCommand::Write {
             path,
             content,
             append,
-        } => write(&workspace, &path, content, append).await,
-        MemoryCommand::Tree { path, depth } => tree(&workspace, &path, depth).await,
-        MemoryCommand::Status => status(&workspace).await,
+        } => write(workspace.as_ref(), &path, content, append).await,
+        MemoryCommand::Tree { path, depth } => tree(workspace.as_ref(), &path, depth).await,
+        MemoryCommand::Status => status(workspace.as_ref()).await,
     }
 }
 

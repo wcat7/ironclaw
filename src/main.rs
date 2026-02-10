@@ -25,7 +25,7 @@ use ironclaw::{
     history::Store,
     llm::{SessionConfig, create_llm_provider, create_session_manager},
     safety::SafetyLayer,
-    secrets::{PostgresSecretsStore, SecretsCrypto, SecretsStore},
+    secrets::{InMemorySecretsStore, PostgresSecretsStore, SecretsCrypto, SecretsStore},
     settings::Settings,
     setup::{SetupConfig, SetupWizard},
     tools::{
@@ -33,7 +33,7 @@ use ironclaw::{
         mcp::{McpClient, McpSessionManager, config::load_mcp_servers, is_authenticated},
         wasm::{WasmToolLoader, WasmToolRuntime},
     },
-    workspace::{EmbeddingProvider, NearAiEmbeddings, OpenAiEmbeddings, Workspace},
+    workspace::{EmbeddingProvider, NearAiEmbeddings, OpenAiEmbeddings},
 };
 
 #[tokio::main]
@@ -118,7 +118,11 @@ async fn main() -> anyhow::Result<()> {
                     None
                 };
 
-            return run_memory_command(mem_cmd.clone(), store.pool(), embeddings).await;
+            let mut workspace = store.new_workspace("default");
+            if let Some(ref emb) = embeddings {
+                workspace = workspace.with_embeddings(emb.clone());
+            }
+            return run_memory_command(mem_cmd.clone(), Arc::new(workspace)).await;
         }
         Some(Command::Status) => {
             let _ = dotenvy::dotenv();
@@ -281,7 +285,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Register memory tools if database is available
     if let Some(ref store) = store {
-        let mut workspace = Workspace::new("default", store.pool());
+        let mut workspace = store.new_workspace("default");
         if let Some(ref emb) = embeddings {
             workspace = workspace.with_embeddings(emb.clone());
         }
@@ -301,14 +305,23 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("Builder mode enabled");
     }
 
-    // Create secrets store if master key is configured (needed for MCP auth and WASM channels)
+    // Create secrets store if master key is configured (needed for MCP auth and WASM channels).
+    // Postgres: persistent secrets; SQLite: in-memory only (secrets do not persist across restarts).
     let secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>> =
         if let (Some(store), Some(master_key)) = (&store, config.secrets.master_key()) {
             match SecretsCrypto::new(master_key.clone()) {
-                Ok(crypto) => Some(Arc::new(PostgresSecretsStore::new(
-                    store.pool(),
-                    Arc::new(crypto),
-                ))),
+                Ok(crypto) => {
+                    let crypto = Arc::new(crypto);
+                    let st: Arc<dyn SecretsStore + Send + Sync> = match store.as_ref() {
+                        ironclaw::history::Store::Postgres(s) => {
+                            Arc::new(PostgresSecretsStore::new(s.pool(), crypto))
+                        }
+                        ironclaw::history::Store::Sqlite(_) => {
+                            Arc::new(InMemorySecretsStore::new(crypto))
+                        }
+                    };
+                    Some(st)
+                }
                 Err(e) => {
                     tracing::warn!("Failed to initialize secrets crypto: {}", e);
                     None
@@ -686,7 +699,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create workspace for agent (shared with memory tools)
     let workspace = store.as_ref().map(|s| {
-        let mut ws = Workspace::new("default", s.pool());
+        let mut ws = s.new_workspace("default");
         if let Some(ref emb) = embeddings {
             ws = ws.with_embeddings(emb.clone());
         }

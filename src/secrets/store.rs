@@ -300,7 +300,7 @@ fn row_to_secret(row: &tokio_postgres::Row) -> Secret {
 }
 
 /// In-memory implementation for testing.
-#[cfg(test)]
+/// In-memory secrets store (used for SQLite backend and tests).
 pub mod testing {
     use std::collections::HashMap;
     use std::sync::Arc;

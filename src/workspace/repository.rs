@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::error::WorkspaceError;
 
 use crate::workspace::document::{MemoryChunk, MemoryDocument, WorkspaceEntry};
+use crate::workspace::repo_backend::WorkspaceRepoBackend;
 use crate::workspace::search::{RankedResult, SearchConfig, SearchResult, reciprocal_rank_fusion};
 
 /// Database repository for workspace operations.
@@ -500,5 +501,110 @@ impl Repository {
                 rank: (i + 1) as u32,
             })
             .collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkspaceRepoBackend for Repository {
+    async fn repo_get_document_by_path(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        path: &str,
+    ) -> Result<MemoryDocument, WorkspaceError> {
+        self.get_document_by_path(user_id, agent_id, path).await
+    }
+
+    async fn repo_get_document_by_id(&self, id: Uuid) -> Result<MemoryDocument, WorkspaceError> {
+        self.get_document_by_id(id).await
+    }
+
+    async fn repo_get_or_create_document_by_path(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        path: &str,
+    ) -> Result<MemoryDocument, WorkspaceError> {
+        self.get_or_create_document_by_path(user_id, agent_id, path).await
+    }
+
+    async fn repo_update_document(&self, id: Uuid, content: &str) -> Result<(), WorkspaceError> {
+        self.update_document(id, content).await
+    }
+
+    async fn repo_delete_document_by_path(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        path: &str,
+    ) -> Result<(), WorkspaceError> {
+        self.delete_document_by_path(user_id, agent_id, path).await
+    }
+
+    async fn repo_list_directory(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+        self.list_directory(user_id, agent_id, directory).await
+    }
+
+    async fn repo_list_all_paths(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<String>, WorkspaceError> {
+        self.list_all_paths(user_id, agent_id).await
+    }
+
+    async fn repo_list_documents(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        self.list_documents(user_id, agent_id).await
+    }
+
+    async fn repo_delete_chunks(&self, document_id: Uuid) -> Result<(), WorkspaceError> {
+        self.delete_chunks(document_id).await
+    }
+
+    async fn repo_insert_chunk(
+        &self,
+        document_id: Uuid,
+        chunk_index: i32,
+        content: &str,
+        embedding: Option<&[f32]>,
+    ) -> Result<Uuid, WorkspaceError> {
+        self.insert_chunk(document_id, chunk_index, content, embedding).await
+    }
+
+    async fn repo_update_chunk_embedding(
+        &self,
+        chunk_id: Uuid,
+        embedding: &[f32],
+    ) -> Result<(), WorkspaceError> {
+        self.update_chunk_embedding(chunk_id, embedding).await
+    }
+
+    async fn repo_get_chunks_without_embeddings(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<MemoryChunk>, WorkspaceError> {
+        self.get_chunks_without_embeddings(user_id, agent_id, limit).await
+    }
+
+    async fn repo_hybrid_search(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        query: &str,
+        embedding: Option<&[f32]>,
+        config: &SearchConfig,
+    ) -> Result<Vec<SearchResult>, WorkspaceError> {
+        self.hybrid_search(user_id, agent_id, query, embedding, config).await
     }
 }

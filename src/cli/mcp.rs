@@ -9,7 +9,7 @@ use clap::Subcommand;
 
 use crate::config::Config;
 use crate::history::Store;
-use crate::secrets::{PostgresSecretsStore, SecretsCrypto, SecretsStore};
+use crate::secrets::{InMemorySecretsStore, PostgresSecretsStore, SecretsCrypto, SecretsStore};
 use crate::tools::mcp::{
     McpClient, McpServerConfig, McpSessionManager, OAuthConfig,
     auth::{authorize_mcp_server, is_authenticated},
@@ -458,11 +458,12 @@ async fn get_secrets_store() -> anyhow::Result<Arc<dyn SecretsStore + Send + Syn
     let store = Store::new(&config.database).await?;
     store.run_migrations().await?;
 
-    let crypto = SecretsCrypto::new(master_key.clone())?;
-    Ok(Arc::new(PostgresSecretsStore::new(
-        store.pool(),
-        Arc::new(crypto),
-    )))
+    let crypto = Arc::new(SecretsCrypto::new(master_key.clone())?);
+    let secrets_store: Arc<dyn SecretsStore + Send + Sync> = match &store {
+        Store::Postgres(s) => Arc::new(PostgresSecretsStore::new(s.pool(), crypto)),
+        Store::Sqlite(_) => Arc::new(InMemorySecretsStore::new(crypto)),
+    };
+    Ok(secrets_store)
 }
 
 #[cfg(test)]

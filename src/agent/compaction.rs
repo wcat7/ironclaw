@@ -91,12 +91,16 @@ impl ContextCompactor {
         let turns_to_remove = thread.turns.len() - keep_recent;
         let old_turns = &thread.turns[..turns_to_remove];
 
-        // Build messages for summarization
+        // Build messages for summarization (use full_messages when present for tool chain context)
         let mut to_summarize = Vec::new();
         for turn in old_turns {
-            to_summarize.push(ChatMessage::user(&turn.user_input));
-            if let Some(ref response) = turn.response {
-                to_summarize.push(ChatMessage::assistant(response));
+            if let Some(ref full) = turn.full_messages {
+                to_summarize.extend(full.clone());
+            } else {
+                to_summarize.push(ChatMessage::user(&turn.user_input));
+                if let Some(ref response) = turn.response {
+                    to_summarize.push(ChatMessage::assistant(response));
+                }
             }
         }
 
@@ -305,9 +309,9 @@ mod tests {
     fn test_format_turns() {
         let mut thread = Thread::new(Uuid::new_v4());
         thread.start_turn("Hello");
-        thread.complete_turn("Hi there");
+        thread.complete_turn("Hi there", None);
         thread.start_turn("How are you?");
-        thread.complete_turn("I'm good!");
+        thread.complete_turn("I'm good!", None);
 
         let formatted = format_turns_for_storage(&thread.turns);
         assert!(formatted.contains("Turn 1"));

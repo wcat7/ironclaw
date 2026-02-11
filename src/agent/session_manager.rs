@@ -1,15 +1,17 @@
 //! Session manager for multi-user, multi-thread conversation handling.
 //!
 //! Maps external channel thread IDs to internal UUIDs and manages undo state
-//! for each thread.
+//! for each thread. Optionally persists sessions to disk under a configurable path.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::agent::session::Session;
+use crate::agent::session::{Session, Thread};
 use crate::agent::undo::UndoManager;
 
 /// Key for mapping external thread IDs to internal ones.
@@ -20,20 +22,224 @@ struct ThreadKey {
     external_thread_id: Option<String>,
 }
 
+/// Persisted session metadata (meta.json per user).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionMeta {
+    session_id: Uuid,
+    active_thread_id: Option<Uuid>,
+    threads: Vec<ThreadMapEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ThreadMapEntry {
+    channel: String,
+    external_thread_id: Option<String>,
+    thread_id: Uuid,
+}
+
 /// Manages sessions, threads, and undo state for all users.
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, Arc<Mutex<Session>>>>,
     thread_map: RwLock<HashMap<ThreadKey, Uuid>>,
     undo_managers: RwLock<HashMap<Uuid, Arc<Mutex<UndoManager>>>>,
+    /// When set, sessions are persisted under this path.
+    persist_path: Option<PathBuf>,
 }
 
 impl SessionManager {
-    /// Create a new session manager.
+    /// Create a new session manager (no persistence).
     pub fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             thread_map: RwLock::new(HashMap::new()),
             undo_managers: RwLock::new(HashMap::new()),
+            persist_path: None,
+        }
+    }
+
+    /// Create a session manager that persists to the given path.
+    /// Loads existing sessions from disk if present.
+    pub async fn new_with_persistence(path: PathBuf) -> Self {
+        let manager = Self {
+            sessions: RwLock::new(HashMap::new()),
+            thread_map: RwLock::new(HashMap::new()),
+            undo_managers: RwLock::new(HashMap::new()),
+            persist_path: Some(path.clone()),
+        };
+        if let Err(e) = manager.load_from_disk().await {
+            tracing::warn!("Session load from disk failed: {}", e);
+        }
+        manager
+    }
+
+    /// Load sessions and thread map from disk. No-op if persist_path is None.
+    async fn load_from_disk(&self) -> Result<(), std::io::Error> {
+        let path = match &self.persist_path {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        };
+        let sessions_dir = path.join("sessions");
+        if !sessions_dir.is_dir() {
+            return Ok(());
+        }
+        let mut read_dir = tokio::fs::read_dir(&sessions_dir).await?;
+        while let Some(entry) = read_dir.next_entry().await? {
+            let user_dir = entry.path();
+            if !user_dir.is_dir() {
+                continue;
+            }
+            let user_id = match entry.file_name().to_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let meta_path = user_dir.join("meta.json");
+            if !meta_path.exists() {
+                continue;
+            }
+            let meta_bytes = match tokio::fs::read(&meta_path).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("Failed to read {}: {}", meta_path.display(), e);
+                    continue;
+                }
+            };
+            let meta: SessionMeta = match serde_json::from_slice(&meta_bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("Invalid meta.json for {}: {}", user_id, e);
+                    continue;
+                }
+            };
+            let mut threads = HashMap::new();
+            let threads_dir = user_dir.join("threads");
+            for entry in &meta.threads {
+                let thread_path = threads_dir.join(format!("{}.json", entry.thread_id));
+                if !thread_path.exists() {
+                    continue;
+                }
+                let thread_bytes = match tokio::fs::read(&thread_path).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("Failed to read thread {}: {}", thread_path.display(), e);
+                        continue;
+                    }
+                };
+                let thread: Thread = match serde_json::from_slice(&thread_bytes) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("Invalid thread {}: {}", entry.thread_id, e);
+                        continue;
+                    }
+                };
+                threads.insert(thread.id, thread);
+            }
+            let last_active_at = threads
+                .values()
+                .map(|t| t.updated_at)
+                .max()
+                .unwrap_or_else(chrono::Utc::now);
+            let session = Session::from_loaded(
+                meta.session_id,
+                &user_id,
+                meta.active_thread_id,
+                threads,
+                last_active_at,
+            );
+            let session = Arc::new(Mutex::new(session));
+            {
+                let mut sessions = self.sessions.write().await;
+                sessions.insert(user_id.clone(), Arc::clone(&session));
+            }
+            for entry in &meta.threads {
+                let key = ThreadKey {
+                    user_id: user_id.clone(),
+                    channel: entry.channel.clone(),
+                    external_thread_id: entry.external_thread_id.clone(),
+                };
+                let mut thread_map = self.thread_map.write().await;
+                thread_map.insert(key, entry.thread_id);
+            }
+            for thread_id in meta.threads.iter().map(|e| e.thread_id) {
+                let mut undo_managers = self.undo_managers.write().await;
+                undo_managers.insert(thread_id, Arc::new(Mutex::new(UndoManager::new())));
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist session meta after creating a new thread or when thread map / active thread changes.
+    pub async fn save_session_meta(&self, user_id: &str, session: &Session) {
+        let path = match &self.persist_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let user_dir = path.join("sessions").join(sanitize_user_dir(user_id));
+        if let Err(e) = tokio::fs::create_dir_all(&user_dir).await {
+            tracing::warn!("Failed to create session dir {}: {}", user_dir.display(), e);
+            return;
+        }
+        let thread_map = self.thread_map.read().await;
+        let threads: Vec<ThreadMapEntry> = thread_map
+            .iter()
+            .filter(|(k, _)| k.user_id == user_id)
+            .map(|(k, &thread_id)| ThreadMapEntry {
+                channel: k.channel.clone(),
+                external_thread_id: k.external_thread_id.clone(),
+                thread_id,
+            })
+            .collect();
+        drop(thread_map);
+        let meta = SessionMeta {
+            session_id: session.id,
+            active_thread_id: session.active_thread,
+            threads,
+        };
+        let meta_path = user_dir.join("meta.json");
+        let json = match serde_json::to_string_pretty(&meta) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("Failed to serialize session meta: {}", e);
+                return;
+            }
+        };
+        if let Err(e) = tokio::fs::write(&meta_path, json).await {
+            tracing::warn!("Failed to write {}: {}", meta_path.display(), e);
+        }
+    }
+
+    /// Persist a single thread to disk. Call after any thread update.
+    pub async fn save_thread(
+        &self,
+        user_id: &str,
+        session: &Arc<Mutex<Session>>,
+        thread_id: Uuid,
+    ) {
+        let path = match &self.persist_path {
+            Some(p) => p.clone(),
+            None => return,
+        };
+        let sess = session.lock().await;
+        let thread = match sess.threads.get(&thread_id) {
+            Some(t) => t.clone(),
+            None => return,
+        };
+        drop(sess);
+        let user_dir = path.join("sessions").join(sanitize_user_dir(user_id));
+        let threads_dir = user_dir.join("threads");
+        if let Err(e) = tokio::fs::create_dir_all(&threads_dir).await {
+            tracing::warn!("Failed to create threads dir {}: {}", threads_dir.display(), e);
+            return;
+        }
+        let thread_path = threads_dir.join(format!("{}.json", thread_id));
+        let json = match serde_json::to_string_pretty(&thread) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("Failed to serialize thread {}: {}", thread_id, e);
+                return;
+            }
+        };
+        if let Err(e) = tokio::fs::write(&thread_path, json).await {
+            tracing::warn!("Failed to write {}: {}", thread_path.display(), e);
         }
     }
 
@@ -95,10 +301,17 @@ impl SessionManager {
             thread.id
         };
 
-        // Store mapping
+        // Store mapping so this key resolves to the new thread
         {
             let mut thread_map = self.thread_map.write().await;
-            thread_map.insert(key, thread_id);
+            thread_map.insert(key.clone(), thread_id);
+            // Always register (user, channel, Some(thread_id)) so the next request with the
+            // returned thread_id resolves to this same thread (whether or not client sent one).
+            let key_with_id = ThreadKey {
+                external_thread_id: Some(thread_id.to_string()),
+                ..key.clone()
+            };
+            thread_map.insert(key_with_id, thread_id);
         }
 
         // Create undo manager for thread
@@ -107,7 +320,40 @@ impl SessionManager {
             undo_managers.insert(thread_id, Arc::new(Mutex::new(UndoManager::new())));
         }
 
+        // Persist session meta when using persistence (new thread + mapping)
+        if self.persist_path.is_some() {
+            let sess = session.lock().await;
+            self.save_session_meta(user_id, &sess).await;
+        }
         (session, thread_id)
+    }
+
+    /// Register an existing thread (e.g. created via /thread new) so it can be resolved by external_thread_id.
+    /// Call after creating a thread outside resolve_thread (e.g. process_new_thread).
+    pub async fn register_thread(
+        &self,
+        user_id: &str,
+        channel: &str,
+        external_thread_id: Option<String>,
+        thread_id: Uuid,
+        session: &Session,
+    ) {
+        let key = ThreadKey {
+            user_id: user_id.to_string(),
+            channel: channel.to_string(),
+            external_thread_id,
+        };
+        {
+            let mut thread_map = self.thread_map.write().await;
+            thread_map.insert(key, thread_id);
+        }
+        {
+            let mut undo_managers = self.undo_managers.write().await;
+            undo_managers.insert(thread_id, Arc::new(Mutex::new(UndoManager::new())));
+        }
+        if self.persist_path.is_some() {
+            self.save_session_meta(user_id, session).await;
+        }
     }
 
     /// Get undo manager for a thread.
@@ -212,6 +458,17 @@ impl Default for SessionManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Sanitize user_id for use as a directory name (no path separators or invalid chars).
+fn sanitize_user_dir(user_id: &str) -> String {
+    user_id
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
+            _ => c,
+        })
+        .collect()
 }
 
 #[cfg(test)]

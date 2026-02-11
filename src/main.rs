@@ -728,7 +728,11 @@ async fn main() -> anyhow::Result<()> {
     let context_manager = Arc::new(ContextManager::new(config.agent.max_parallel_jobs));
 
     // Create session manager (shared between agent and web gateway)
-    let session_manager = Arc::new(SessionManager::new());
+    let session_manager = if let Some(path) = config.agent.session_store_path.clone() {
+        Arc::new(SessionManager::new_with_persistence(path).await)
+    } else {
+        Arc::new(SessionManager::new())
+    };
 
     // Register job tools
     tools.register_job_tools(Arc::clone(&context_manager));

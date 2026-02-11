@@ -45,8 +45,11 @@ fn truncate_for_preview(output: &str, max_chars: usize) -> String {
 
 /// Result of the agentic loop execution.
 enum AgenticLoopResult {
-    /// Completed with a response.
-    Response(String),
+    /// Completed with a response and full context for this turn.
+    Response {
+        text: String,
+        context_messages: Vec<ChatMessage>,
+    },
     /// A tool requires approval before continuing.
     NeedApproval {
         /// The pending approval request to store.
@@ -694,13 +697,16 @@ impl Agent {
 
         // Complete, fail, or request approval
         match result {
-            Ok(AgenticLoopResult::Response(response)) => {
-                thread.complete_turn(&response);
+            Ok(AgenticLoopResult::Response {
+                text,
+                context_messages,
+            }) => {
+                thread.complete_turn(&text, Some(context_messages));
                 let user_input = thread
                     .last_turn()
                     .map(|t| t.user_input.clone())
                     .unwrap_or_default();
-                let response_text = response.clone();
+                let response_text = text.clone();
                 let channel = message.channel.clone();
                 let user_id = message.user_id.clone();
                 let thread_id_str = thread_id.to_string();
@@ -726,7 +732,10 @@ impl Agent {
                         &message.metadata,
                     )
                     .await;
-                Ok(SubmissionResult::response(response).with_thread_id(thread_id.to_string()))
+                self.session_manager
+                    .save_thread(&message.user_id, &session, thread_id)
+                    .await;
+                Ok(SubmissionResult::response(text).with_thread_id(thread_id.to_string()))
             }
             Ok(AgenticLoopResult::NeedApproval { pending }) => {
                 // Store pending approval in thread and update state
@@ -735,6 +744,10 @@ impl Agent {
                 let description = pending.description.clone();
                 let parameters = pending.parameters.clone();
                 thread.await_approval(pending);
+                drop(sess);
+                self.session_manager
+                    .save_thread(&message.user_id, &session, thread_id)
+                    .await;
                 let _ = self
                     .channels
                     .send_status(
@@ -752,6 +765,10 @@ impl Agent {
             }
             Err(e) => {
                 thread.fail_turn(e.to_string());
+                drop(sess);
+                self.session_manager
+                    .save_thread(&message.user_id, &session, thread_id)
+                    .await;
                 Ok(SubmissionResult::error(e.to_string()))
             }
         }
@@ -854,7 +871,10 @@ impl Agent {
                     }
 
                     // Tools have been executed or we've tried multiple times, return response
-                    return Ok(AgenticLoopResult::Response(text));
+                    return Ok(AgenticLoopResult::Response {
+                        text,
+                        context_messages: context_messages.clone(),
+                    });
                 }
                 RespondResult::ToolCalls(tool_calls) => {
                     tools_executed = true;
@@ -988,7 +1008,10 @@ impl Agent {
                             if let Some(thread) = sess.threads.get_mut(&thread_id) {
                                 thread.enter_auth_mode(ext_name);
                             }
-                            return Ok(AgenticLoopResult::Response(instructions));
+                            return Ok(AgenticLoopResult::Response {
+                                text: instructions,
+                                context_messages: context_messages.clone(),
+                            });
                         }
 
                         // Add tool result to context for next LLM call
@@ -1193,19 +1216,25 @@ impl Agent {
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+        let user_id = {
+            let mut sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get_mut(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
-        match thread.state {
-            ThreadState::Processing | ThreadState::AwaitingApproval => {
-                thread.interrupt();
-                Ok(SubmissionResult::ok_with_message("Interrupted."))
+            match thread.state {
+                ThreadState::Processing | ThreadState::AwaitingApproval => {
+                    thread.interrupt();
+                    sess.user_id.clone()
+                }
+                _ => return Ok(SubmissionResult::ok_with_message("Nothing to interrupt.")),
             }
-            _ => Ok(SubmissionResult::ok_with_message("Nothing to interrupt.")),
-        }
+        };
+        self.session_manager
+            .save_thread(&user_id, &session, thread_id)
+            .await;
+        Ok(SubmissionResult::ok_with_message("Interrupted."))
     }
 
     async fn process_compact(
@@ -1213,32 +1242,38 @@ impl Agent {
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+        let (user_id, usage, result) = {
+            let mut sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get_mut(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
-        let messages = thread.messages();
-        let usage = self.context_monitor.usage_percent(&messages);
-        let strategy = self
-            .context_monitor
-            .suggest_compaction(&messages)
-            .unwrap_or(
-                crate::agent::context_monitor::CompactionStrategy::Summarize { keep_recent: 5 },
-            );
+            let messages = thread.messages();
+            let usage = self.context_monitor.usage_percent(&messages);
+            let strategy = self
+                .context_monitor
+                .suggest_compaction(&messages)
+                .unwrap_or(
+                    crate::agent::context_monitor::CompactionStrategy::Summarize { keep_recent: 5 },
+                );
 
-        let compactor = ContextCompactor::new(self.llm().clone());
-        match compactor
-            .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
-            .await
-        {
-            Ok(result) => {
+            let compactor = ContextCompactor::new(self.llm().clone());
+            let result = compactor
+                .compact(thread, strategy, self.workspace().map(|w| w.as_ref()))
+                .await;
+            (sess.user_id.clone(), usage, result)
+        };
+        match result {
+            Ok(r) => {
+                self.session_manager
+                    .save_thread(&user_id, &session, thread_id)
+                    .await;
                 let mut msg = format!(
                     "Compacted: {} turns removed, {} → {} tokens (was {:.1}% full)",
-                    result.turns_removed, result.tokens_before, result.tokens_after, usage
+                    r.turns_removed, r.tokens_before, r.tokens_after, usage
                 );
-                if result.summary_written {
+                if r.summary_written {
                     msg.push_str(", summary saved to workspace");
                 }
                 Ok(SubmissionResult::ok_with_message(msg))
@@ -1252,18 +1287,21 @@ impl Agent {
         session: Arc<Mutex<Session>>,
         thread_id: Uuid,
     ) -> Result<SubmissionResult, Error> {
-        let mut sess = session.lock().await;
-        let thread = sess
-            .threads
-            .get_mut(&thread_id)
-            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-        thread.turns.clear();
-        thread.state = ThreadState::Idle;
-
-        // Clear undo history too
+        let user_id = {
+            let mut sess = session.lock().await;
+            let thread = sess
+                .threads
+                .get_mut(&thread_id)
+                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+            thread.turns.clear();
+            thread.state = ThreadState::Idle;
+            sess.user_id.clone()
+        };
         let undo_mgr = self.session_manager.get_undo_manager(thread_id).await;
         undo_mgr.lock().await.clear();
-
+        self.session_manager
+            .save_thread(&user_id, &session, thread_id)
+            .await;
         Ok(SubmissionResult::ok_with_message("Thread cleared."))
     }
 
@@ -1408,7 +1446,7 @@ impl Agent {
                     let mut sess = session.lock().await;
                     if let Some(thread) = sess.threads.get_mut(&thread_id) {
                         thread.enter_auth_mode(ext_name);
-                        thread.complete_turn(&instructions);
+                        thread.complete_turn(&instructions, None);
                     }
                 }
                 let _ = self
@@ -1456,13 +1494,16 @@ impl Agent {
                 .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
             match result {
-                Ok(AgenticLoopResult::Response(response)) => {
-                    thread.complete_turn(&response);
+                Ok(AgenticLoopResult::Response {
+                    text,
+                    context_messages,
+                }) => {
+                    thread.complete_turn(&text, Some(context_messages));
                     let user_input = thread
                         .last_turn()
                         .map(|t| t.user_input.clone())
                         .unwrap_or_default();
-                    let response_text = response.clone();
+                    let response_text = text.clone();
                     let channel = message.channel.clone();
                     let user_id = message.user_id.clone();
                     let thread_id_str = thread_id.to_string();
@@ -1488,7 +1529,10 @@ impl Agent {
                             &message.metadata,
                         )
                         .await;
-                    Ok(SubmissionResult::response(response).with_thread_id(thread_id.to_string()))
+                    self.session_manager
+                        .save_thread(&message.user_id, &session, thread_id)
+                        .await;
+                    Ok(SubmissionResult::response(text).with_thread_id(thread_id.to_string()))
                 }
                 Ok(AgenticLoopResult::NeedApproval {
                     pending: new_pending,
@@ -1515,6 +1559,10 @@ impl Agent {
                 }
                 Err(e) => {
                     thread.fail_turn(e.to_string());
+                    drop(sess);
+                    self.session_manager
+                        .save_thread(&message.user_id, &session, thread_id)
+                        .await;
                     Ok(SubmissionResult::error(e.to_string()))
                 }
             }
@@ -1526,6 +1574,9 @@ impl Agent {
                     thread.clear_pending_approval();
                 }
             }
+            self.session_manager
+                .save_thread(&message.user_id, &session, thread_id)
+                .await;
 
             let _ = self
                 .channels
@@ -1644,9 +1695,25 @@ impl Agent {
             .session_manager
             .get_or_create_session(&message.user_id)
             .await;
-        let mut sess = session.lock().await;
-        let thread = sess.create_thread();
-        let thread_id = thread.id;
+        let (thread_id, session_snapshot) = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            let thread_id = thread.id;
+            let snapshot = (*sess).clone();
+            (thread_id, snapshot)
+        };
+        self.session_manager
+            .register_thread(
+                &message.user_id,
+                &message.channel,
+                Some(thread_id.to_string()),
+                thread_id,
+                &session_snapshot,
+            )
+            .await;
+        self.session_manager
+            .save_thread(&message.user_id, &session, thread_id)
+            .await;
         Ok(SubmissionResult::ok_with_message(format!(
             "New thread: {}",
             thread_id
@@ -1662,9 +1729,15 @@ impl Agent {
             .session_manager
             .get_or_create_session(&message.user_id)
             .await;
-        let mut sess = session.lock().await;
-
-        if sess.switch_thread(target_thread_id) {
+        let switched = {
+            let mut sess = session.lock().await;
+            sess.switch_thread(target_thread_id)
+        };
+        if switched {
+            let sess = session.lock().await;
+            self.session_manager
+                .save_session_meta(&message.user_id, &*sess)
+                .await;
             Ok(SubmissionResult::ok_with_message(format!(
                 "Switched to thread {}",
                 target_thread_id
@@ -1684,12 +1757,18 @@ impl Agent {
         let mut mgr = undo_mgr.lock().await;
 
         if let Some(checkpoint) = mgr.restore(checkpoint_id) {
-            let mut sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-            thread.restore_from_messages(checkpoint.messages);
+            let user_id = {
+                let mut sess = session.lock().await;
+                let thread = sess
+                    .threads
+                    .get_mut(&thread_id)
+                    .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+                thread.restore_from_messages(checkpoint.messages);
+                sess.user_id.clone()
+            };
+            self.session_manager
+                .save_thread(&user_id, &session, thread_id)
+                .await;
             Ok(SubmissionResult::ok_with_message(format!(
                 "Resumed from checkpoint: {}",
                 checkpoint.description

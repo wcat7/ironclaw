@@ -135,6 +135,7 @@ This document tracks feature parity between IronClaw (Rust implementation) and O
 | RPC-based execution | ✅ | 🚧 | Worker isolation |
 | Multi-provider failover | ✅ | ❌ | Provider fallback chains |
 | Per-sender sessions | ✅ | ✅ | |
+| Session/thread persistence | ✅ | ✅ | Default on (~/.ironclaw/sessions); SESSION_STORE_PATH overrides or set empty to disable |
 | Global sessions | ✅ | ❌ | Optional shared context |
 | Session pruning | ✅ | ❌ | Auto cleanup old sessions |
 | Context compaction | ✅ | ✅ | Auto summarization |

@@ -56,6 +56,27 @@ impl Session {
         }
     }
 
+    /// Reconstruct session from persisted state (e.g. load from disk).
+    pub fn from_loaded(
+        id: Uuid,
+        user_id: impl Into<String>,
+        active_thread: Option<Uuid>,
+        threads: HashMap<Uuid, Thread>,
+        last_active_at: DateTime<Utc>,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id,
+            user_id: user_id.into(),
+            active_thread,
+            threads,
+            created_at: now,
+            last_active_at,
+            metadata: serde_json::Value::Null,
+            auto_approved_tools: HashSet::new(),
+        }
+    }
+
     /// Check if a tool has been auto-approved for this session.
     pub fn is_tool_auto_approved(&self, tool_name: &str) -> bool {
         self.auto_approved_tools.contains(tool_name)
@@ -217,10 +238,14 @@ impl Thread {
         self.turns.last_mut().expect("just pushed")
     }
 
-    /// Complete the current turn with a response.
-    pub fn complete_turn(&mut self, response: impl Into<String>) {
+    /// Complete the current turn with a response and optional full message chain.
+    pub fn complete_turn(
+        &mut self,
+        response: impl Into<String>,
+        full_messages: Option<Vec<ChatMessage>>,
+    ) {
         if let Some(turn) = self.turns.last_mut() {
-            turn.complete(response);
+            turn.complete(response, full_messages);
         }
         self.state = ThreadState::Idle;
         self.updated_at = Utc::now();
@@ -284,12 +309,17 @@ impl Thread {
     }
 
     /// Get all messages for context building.
+    /// Uses full_messages per turn when present (includes tool_calls and tool results).
     pub fn messages(&self) -> Vec<ChatMessage> {
         let mut messages = Vec::new();
         for turn in &self.turns {
-            messages.push(ChatMessage::user(&turn.user_input));
-            if let Some(ref response) = turn.response {
-                messages.push(ChatMessage::assistant(response));
+            if let Some(ref full) = turn.full_messages {
+                messages.extend(full.clone());
+            } else {
+                messages.push(ChatMessage::user(&turn.user_input));
+                if let Some(ref response) = turn.response {
+                    messages.push(ChatMessage::assistant(response));
+                }
             }
         }
         messages
@@ -327,7 +357,7 @@ impl Thread {
                 if let Some(next) = iter.peek() {
                     if next.role == crate::llm::Role::Assistant {
                         let response = iter.next().expect("peeked");
-                        turn.complete(&response.content);
+                        turn.complete(&response.content, None);
                     }
                 }
 
@@ -362,6 +392,10 @@ pub struct Turn {
     pub user_input: String,
     /// Agent response (if completed).
     pub response: Option<String>,
+    /// Full message chain for this turn (user, assistant+tool_calls, tool results, final assistant).
+    /// When set, used by Thread::messages() for full context; otherwise fallback to user_input + response.
+    #[serde(default)]
+    pub full_messages: Option<Vec<ChatMessage>>,
     /// Tool calls made during this turn.
     pub tool_calls: Vec<TurnToolCall>,
     /// Turn state.
@@ -381,6 +415,7 @@ impl Turn {
             turn_number,
             user_input: user_input.into(),
             response: None,
+            full_messages: None,
             tool_calls: Vec::new(),
             state: TurnState::Processing,
             started_at: Utc::now(),
@@ -389,9 +424,14 @@ impl Turn {
         }
     }
 
-    /// Complete this turn.
-    pub fn complete(&mut self, response: impl Into<String>) {
+    /// Complete this turn with optional full message chain (for context replay).
+    pub fn complete(
+        &mut self,
+        response: impl Into<String>,
+        full_messages: Option<Vec<ChatMessage>>,
+    ) {
         self.response = Some(response.into());
+        self.full_messages = full_messages;
         self.state = TurnState::Completed;
         self.completed_at = Some(Utc::now());
     }
@@ -468,7 +508,7 @@ mod tests {
         assert_eq!(thread.state, ThreadState::Processing);
         assert_eq!(thread.turns.len(), 1);
 
-        thread.complete_turn("Hi there!");
+        thread.complete_turn("Hi there!", None);
         assert_eq!(thread.state, ThreadState::Idle);
         assert_eq!(thread.turns[0].response, Some("Hi there!".to_string()));
     }
@@ -478,9 +518,9 @@ mod tests {
         let mut thread = Thread::new(Uuid::new_v4());
 
         thread.start_turn("First message");
-        thread.complete_turn("First response");
+        thread.complete_turn("First response", None);
         thread.start_turn("Second message");
-        thread.complete_turn("Second response");
+        thread.complete_turn("Second response", None);
 
         let messages = thread.messages();
         assert_eq!(messages.len(), 4);
@@ -502,7 +542,7 @@ mod tests {
 
         // First add some turns
         thread.start_turn("Original message");
-        thread.complete_turn("Original response");
+        thread.complete_turn("Original response", None);
 
         // Now restore from different messages
         let messages = vec![

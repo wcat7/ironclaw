@@ -577,6 +577,14 @@ fn default_channels_dir() -> PathBuf {
         .join("channels")
 }
 
+/// Get the default session store directory (~/.ironclaw/sessions/).
+fn default_session_store_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ironclaw")
+        .join("sessions")
+}
+
 /// Agent behavior configuration.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -590,6 +598,8 @@ pub struct AgentConfig {
     pub use_planning: bool,
     /// Session idle timeout. Sessions inactive longer than this are pruned.
     pub session_idle_timeout: Duration,
+    /// Directory for session/thread persistence. Default ~/.ironclaw/sessions; set SESSION_STORE_PATH to override or set to empty to disable.
+    pub session_store_path: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -663,6 +673,18 @@ impl AgentConfig {
                     })?
                     .unwrap_or(settings.agent.session_idle_timeout_secs),
             ),
+            session_store_path: {
+                match std::env::var("SESSION_STORE_PATH") {
+                    Err(std::env::VarError::NotPresent) => Some(default_session_store_path()),
+                    Err(e) => {
+                        return Err(ConfigError::ParseError(format!(
+                            "failed to read SESSION_STORE_PATH: {e}"
+                        )))
+                    }
+                    Ok(s) if s.trim().is_empty() => None,
+                    Ok(s) => Some(PathBuf::from(s)),
+                }
+            },
         })
     }
 }

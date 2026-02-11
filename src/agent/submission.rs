@@ -249,6 +249,8 @@ pub enum SubmissionResult {
     Response {
         /// The agent's response.
         content: String,
+        /// Internal thread ID for the channel to include in the reply (e.g. SSE so client can persist).
+        thread_id: Option<String>,
     },
 
     /// Need approval before continuing.
@@ -280,10 +282,22 @@ pub enum SubmissionResult {
 }
 
 impl SubmissionResult {
-    /// Create a response result.
+    /// Create a response result with optional thread_id for the channel to echo back.
     pub fn response(content: impl Into<String>) -> Self {
         Self::Response {
             content: content.into(),
+            thread_id: None,
+        }
+    }
+
+    /// Add thread_id to a Response result (use after response() when you have the id).
+    pub fn with_thread_id(self, thread_id: impl Into<String>) -> Self {
+        match self {
+            Self::Response { content, .. } => Self::Response {
+                content,
+                thread_id: Some(thread_id.into()),
+            },
+            other => other,
         }
     }
 

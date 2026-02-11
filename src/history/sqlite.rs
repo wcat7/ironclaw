@@ -240,6 +240,52 @@ impl SqliteStore {
         Ok(id)
     }
 
+    /// Look up conversation by channel, user_id, and thread_id. Returns None if not found.
+    pub async fn get_conversation_by_thread(
+        &self,
+        channel: &str,
+        user_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<Uuid>, DatabaseError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM conversations WHERE channel = ? AND user_id = ? AND thread_id = ?",
+        )
+        .bind(channel)
+        .bind(user_id)
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(row.and_then(|(id,)| Uuid::parse_str(&id).ok()))
+    }
+
+    /// Get messages for a conversation, ordered by created_at ascending. Limit 0 = no limit.
+    pub async fn get_conversation_messages(
+        &self,
+        conversation_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>, DatabaseError> {
+        let rows = if limit > 0 {
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT role, content, created_at FROM conversation_messages \
+                 WHERE conversation_id = ? ORDER BY created_at ASC LIMIT ?",
+            )
+            .bind(conversation_id.to_string())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+        } else {
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT role, content, created_at FROM conversation_messages \
+                 WHERE conversation_id = ? ORDER BY created_at ASC",
+            )
+            .bind(conversation_id.to_string())
+            .fetch_all(&self.pool)
+        }
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(rows)
+    }
+
     pub async fn save_job(&self, ctx: &JobContext) -> Result<(), DatabaseError> {
         let status = ctx.state.to_string();
         let estimated_time_secs = ctx.estimated_duration.map(|d| d.as_secs() as i32);

@@ -34,6 +34,7 @@ use crate::config::GatewayConfig;
 use crate::context::ContextManager;
 use crate::error::ChannelError;
 use crate::extensions::ExtensionManager;
+use crate::history::Store;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
 
@@ -72,6 +73,7 @@ impl GatewayChannel {
             workspace: None,
             context_manager: None,
             session_manager: None,
+            store: None,
             log_broadcaster: None,
             extension_manager: None,
             tool_registry: None,
@@ -95,6 +97,7 @@ impl GatewayChannel {
             workspace: self.state.workspace.clone(),
             context_manager: self.state.context_manager.clone(),
             session_manager: self.state.session_manager.clone(),
+            store: self.state.store.clone(),
             log_broadcaster: self.state.log_broadcaster.clone(),
             extension_manager: self.state.extension_manager.clone(),
             tool_registry: self.state.tool_registry.clone(),
@@ -121,6 +124,12 @@ impl GatewayChannel {
     /// Inject the session manager for thread/session info.
     pub fn with_session_manager(mut self, sm: Arc<SessionManager>) -> Self {
         self.rebuild_state(|s| s.session_manager = Some(sm));
+        self
+    }
+
+    /// Inject the store for persisted conversation history.
+    pub fn with_store(mut self, store: Arc<Store>) -> Self {
+        self.rebuild_state(|s| s.store = Some(store));
         self
     }
 
@@ -187,7 +196,11 @@ impl Channel for GatewayChannel {
         msg: &IncomingMessage,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
-        let thread_id = msg.thread_id.clone().unwrap_or_default();
+        let thread_id = response
+            .thread_id
+            .clone()
+            .or_else(|| msg.thread_id.clone())
+            .unwrap_or_default();
 
         self.state.sse.broadcast(SseEvent::Response {
             content: response.content,

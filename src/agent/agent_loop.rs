@@ -352,11 +352,12 @@ impl Agent {
             };
 
             match self.handle_message(&message).await {
-                Ok(Some(response)) if !response.is_empty() => {
-                    let _ = self
-                        .channels
-                        .respond(&message, OutgoingResponse::text(response))
-                        .await;
+                Ok(Some((response, thread_id))) if !response.is_empty() => {
+                    let mut resp = OutgoingResponse::text(response);
+                    if let Some(tid) = thread_id {
+                        resp = resp.in_thread(tid);
+                    }
+                    let _ = self.channels.respond(&message, resp).await;
                 }
                 Ok(Some(_)) => {
                     // Empty response, nothing to send (e.g. approval handled via send_status)
@@ -389,7 +390,7 @@ impl Agent {
         Ok(())
     }
 
-    async fn handle_message(&self, message: &IncomingMessage) -> Result<Option<String>, Error> {
+    async fn handle_message(&self, message: &IncomingMessage) -> Result<Option<(String, Option<String>)>, Error> {
         // Parse submission type first
         let submission = SubmissionParser::parse(&message.content);
 
@@ -416,9 +417,10 @@ impl Agent {
         if let Some(pending) = pending_auth {
             match &submission {
                 Submission::UserInput { content } => {
-                    return self
+                    let opt = self
                         .process_auth_token(message, &pending, content, session, thread_id)
-                        .await;
+                        .await?;
+                    return Ok(opt.map(|s| (s, Some(thread_id.to_string()))));
                 }
                 _ => {
                     // Any control submission (interrupt, undo, etc.) cancels auth mode
@@ -481,12 +483,12 @@ impl Agent {
             }
         };
 
-        // Convert SubmissionResult to response string
+        // Convert SubmissionResult to response string and optional thread_id for channel
         match result? {
-            SubmissionResult::Response { content } => Ok(Some(content)),
-            SubmissionResult::Ok { message } => Ok(message),
-            SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
-            SubmissionResult::Interrupted => Ok(Some("Interrupted.".into())),
+            SubmissionResult::Response { content, thread_id } => Ok(Some((content, thread_id))),
+            SubmissionResult::Ok { message } => Ok(message.map(|m| (m, None))),
+            SubmissionResult::Error { message } => Ok(Some((format!("Error: {}", message), None))),
+            SubmissionResult::Interrupted => Ok(Some(("Interrupted.".into(), None))),
             SubmissionResult::NeedApproval {
                 request_id,
                 tool_name,
@@ -510,7 +512,7 @@ impl Agent {
                     .await;
 
                 // Empty string signals the caller to skip respond() (no duplicate text)
-                Ok(Some(String::new()))
+                Ok(Some((String::new(), None)))
             }
         }
     }
@@ -694,15 +696,37 @@ impl Agent {
         match result {
             Ok(AgenticLoopResult::Response(response)) => {
                 thread.complete_turn(&response);
+                let user_input = thread
+                    .last_turn()
+                    .map(|t| t.user_input.clone())
+                    .unwrap_or_default();
+                let response_text = response.clone();
+                let channel = message.channel.clone();
+                let user_id = message.user_id.clone();
+                let thread_id_str = thread_id.to_string();
+                drop(sess);
+                if let Some(store) = self.store() {
+                    if let Ok(conv_id) = store
+                        .get_or_create_conversation_by_thread(&channel, &user_id, &thread_id_str)
+                        .await
+                    {
+                        let _ = store
+                            .add_conversation_message(conv_id, "user", &user_input)
+                            .await;
+                        let _ = store
+                            .add_conversation_message(conv_id, "assistant", &response_text)
+                            .await;
+                    }
+                }
                 let _ = self
                     .channels
                     .send_status(
-                        &message.channel,
+                        &channel,
                         StatusUpdate::Status("Done".into()),
                         &message.metadata,
                     )
                     .await;
-                Ok(SubmissionResult::response(response))
+                Ok(SubmissionResult::response(response).with_thread_id(thread_id.to_string()))
             }
             Ok(AgenticLoopResult::NeedApproval { pending }) => {
                 // Store pending approval in thread and update state
@@ -1395,7 +1419,7 @@ impl Agent {
                         &message.metadata,
                     )
                     .await;
-                return Ok(SubmissionResult::response(instructions));
+                return Ok(SubmissionResult::response(instructions).with_thread_id(thread_id.to_string()));
             }
 
             // Add tool result to context
@@ -1434,15 +1458,37 @@ impl Agent {
             match result {
                 Ok(AgenticLoopResult::Response(response)) => {
                     thread.complete_turn(&response);
+                    let user_input = thread
+                        .last_turn()
+                        .map(|t| t.user_input.clone())
+                        .unwrap_or_default();
+                    let response_text = response.clone();
+                    let channel = message.channel.clone();
+                    let user_id = message.user_id.clone();
+                    let thread_id_str = thread_id.to_string();
+                    drop(sess);
+                    if let Some(store) = self.store() {
+                        if let Ok(conv_id) = store
+                            .get_or_create_conversation_by_thread(&channel, &user_id, &thread_id_str)
+                            .await
+                        {
+                            let _ = store
+                                .add_conversation_message(conv_id, "user", &user_input)
+                                .await;
+                            let _ = store
+                                .add_conversation_message(conv_id, "assistant", &response_text)
+                                .await;
+                        }
+                    }
                     let _ = self
                         .channels
                         .send_status(
-                            &message.channel,
+                            &channel,
                             StatusUpdate::Status("Done".into()),
                             &message.metadata,
                         )
                         .await;
-                    Ok(SubmissionResult::response(response))
+                    Ok(SubmissionResult::response(response).with_thread_id(thread_id.to_string()))
                 }
                 Ok(AgenticLoopResult::NeedApproval {
                     pending: new_pending,
@@ -1494,7 +1540,7 @@ impl Agent {
                 "Tool '{}' was rejected. The agent will not execute this tool.\n\n\
                  You can continue the conversation or try a different approach.",
                 pending.tool_name
-            )))
+            )).with_thread_id(thread_id.to_string()))
         }
     }
 
@@ -1885,7 +1931,7 @@ impl Agent {
             Ok(response) => Ok(SubmissionResult::response(format!(
                 "Thread Summary:\n\n{}",
                 response.content.trim()
-            ))),
+            )).with_thread_id(thread_id.to_string())),
             Err(e) => Ok(SubmissionResult::error(format!("Summarize failed: {}", e))),
         }
     }
@@ -1932,7 +1978,7 @@ impl Agent {
             Ok(response) => Ok(SubmissionResult::response(format!(
                 "Suggested Next Steps:\n\n{}",
                 response.content.trim()
-            ))),
+            )).with_thread_id(thread_id.to_string())),
             Err(e) => Ok(SubmissionResult::error(format!("Suggest failed: {}", e))),
         }
     }

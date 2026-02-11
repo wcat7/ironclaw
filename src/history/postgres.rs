@@ -101,6 +101,58 @@ impl PostgresStore {
         Ok(id)
     }
 
+    /// Look up conversation by channel, user_id, and thread_id. Returns None if not found.
+    pub async fn get_conversation_by_thread(
+        &self,
+        channel: &str,
+        user_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<Uuid>, DatabaseError> {
+        let conn = self.conn().await?;
+        let row = conn
+            .query_opt(
+                "SELECT id FROM conversations WHERE channel = $1 AND user_id = $2 AND thread_id = $3",
+                &[&channel, &user_id, &thread_id],
+            )
+            .await?;
+        Ok(row.map(|r| r.get::<_, Uuid>("id")))
+    }
+
+    /// Get messages for a conversation, ordered by created_at ascending. Limit 0 = no limit.
+    pub async fn get_conversation_messages(
+        &self,
+        conversation_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>, DatabaseError> {
+        let conn = self.conn().await?;
+        let rows = if limit > 0 {
+            conn.query(
+                "SELECT role, content, created_at::text FROM conversation_messages \
+                 WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT $2",
+                &[&conversation_id, &(limit as i64)],
+            )
+            .await?
+        } else {
+            conn.query(
+                "SELECT role, content, created_at::text FROM conversation_messages \
+                 WHERE conversation_id = $1 ORDER BY created_at ASC",
+                &[&conversation_id],
+            )
+            .await?
+        };
+        let out: Vec<(String, String, String)> = rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<_, String>("role"),
+                    r.get::<_, String>("content"),
+                    r.get::<_, String>("created_at"),
+                )
+            })
+            .collect();
+        Ok(out)
+    }
+
     // ==================== Jobs ====================
 
     pub async fn save_job(&self, ctx: &JobContext) -> Result<(), DatabaseError> {

@@ -120,6 +120,55 @@ impl Store {
         }
     }
 
+    /// Get conversation by channel, user_id, and thread_id. Returns None if not found (read-only).
+    pub async fn get_conversation_by_thread(
+        &self,
+        channel: &str,
+        user_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<Uuid>, DatabaseError> {
+        match self {
+            Store::Postgres(s) => s.get_conversation_by_thread(channel, user_id, thread_id).await,
+            Store::Sqlite(s) => s.get_conversation_by_thread(channel, user_id, thread_id).await,
+        }
+    }
+
+    /// Get or create a conversation by channel, user_id, and thread_id.
+    /// Returns the conversation UUID (existing or newly created).
+    pub async fn get_or_create_conversation_by_thread(
+        &self,
+        channel: &str,
+        user_id: &str,
+        thread_id: &str,
+    ) -> Result<Uuid, DatabaseError> {
+        match self {
+            Store::Postgres(s) => {
+                if let Some(id) = s.get_conversation_by_thread(channel, user_id, thread_id).await? {
+                    return Ok(id);
+                }
+                s.create_conversation(channel, user_id, Some(thread_id)).await
+            }
+            Store::Sqlite(s) => {
+                if let Some(id) = s.get_conversation_by_thread(channel, user_id, thread_id).await? {
+                    return Ok(id);
+                }
+                s.create_conversation(channel, user_id, Some(thread_id)).await
+            }
+        }
+    }
+
+    /// Get messages for a conversation: (role, content, created_at). Limit 0 = no limit.
+    pub async fn get_conversation_messages(
+        &self,
+        conversation_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>, DatabaseError> {
+        match self {
+            Store::Postgres(s) => s.get_conversation_messages(conversation_id, limit).await,
+            Store::Sqlite(s) => s.get_conversation_messages(conversation_id, limit).await,
+        }
+    }
+
     // ==================== Jobs ====================
 
     pub async fn save_job(&self, ctx: &JobContext) -> Result<(), DatabaseError> {

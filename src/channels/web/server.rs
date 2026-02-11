@@ -30,6 +30,7 @@ use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
 use crate::context::ContextManager;
 use crate::extensions::ExtensionManager;
+use crate::history::Store;
 use crate::tools::ToolRegistry;
 use crate::workspace::Workspace;
 
@@ -45,6 +46,8 @@ pub struct GatewayState {
     pub context_manager: Option<Arc<ContextManager>>,
     /// Session manager for thread info.
     pub session_manager: Option<Arc<SessionManager>>,
+    /// Store for persisted conversation history (gateway channel).
+    pub store: Option<Arc<Store>>,
     /// Log broadcaster for the logs SSE endpoint.
     pub log_broadcaster: Option<Arc<LogBroadcaster>>,
     /// Extension manager for extension management API.
@@ -298,10 +301,55 @@ struct HistoryQuery {
     thread_id: Option<String>,
 }
 
+/// Build TurnInfo list from stored messages (role, content, created_at). Pairs user + assistant.
+fn messages_to_turns(
+    rows: Vec<(String, String, String)>,
+) -> Vec<TurnInfo> {
+    let mut turns = Vec::new();
+    let mut i = 0;
+    while i + 1 < rows.len() {
+        let (role1, content1, ts1) = &rows[i];
+        let (role2, content2, ts2) = &rows[i + 1];
+        if role1 == "user" && role2 == "assistant" {
+            turns.push(TurnInfo {
+                turn_number: turns.len() + 1,
+                user_input: content1.clone(),
+                response: Some(content2.clone()),
+                state: "Idle".to_string(),
+                started_at: ts1.clone(),
+                completed_at: Some(ts2.clone()),
+                tool_calls: vec![],
+            });
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    turns
+}
+
 async fn chat_history_handler(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, (StatusCode, String)> {
+    // When thread_id is provided and store is available, try persisted history first (read-only; do not create).
+    if let (Some(ref tid), Some(ref store)) = (query.thread_id.as_ref(), state.store.as_ref()) {
+        if let Ok(thread_id) = Uuid::parse_str(tid) {
+            let conv_opt = store
+                .get_conversation_by_thread("gateway", &state.user_id, tid)
+                .await;
+            if let Ok(Some(conv_id)) = conv_opt {
+                let rows_result = store.get_conversation_messages(conv_id, 0).await;
+                if let Ok(rows) = rows_result {
+                    if !rows.is_empty() {
+                        let turns = messages_to_turns(rows);
+                        return Ok(Json(HistoryResponse { thread_id, turns }));
+                    }
+                }
+            }
+        }
+    }
+
     let session_manager = state.session_manager.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Session manager not available".to_string(),
